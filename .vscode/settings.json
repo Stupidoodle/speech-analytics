@@ -1,0 +1,12 @@
+{
+    "python.testing.pytestArgs": [
+        "src",
+        "-s"
+    ],
+    "python.testing.autoTestDiscoverOnSaveEnabled": true,
+    "python.terminal.executeInFileDir": true,
+    "python.terminal.activateEnvironment": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "activestate.promptRuntimeCreation": false
+}
