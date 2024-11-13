@@ -9,6 +9,8 @@ from .exceptions import (
     CaptureError,
     DeviceError,
 )
+from src.events.types import EventType, Event
+from src.events.bus import EventBus
 
 
 class AudioCapture:
@@ -18,11 +20,13 @@ class AudioCapture:
     """
 
     def __init__(self,
+                 event_bus: EventBus,
                  mic_device_id: Optional[int] = None,
                  desktop_device_id: Optional[int] = None,
                  sample_rate: int = 44100,
                  chunk_size: int = 1024,
-                 channels: int = 1):
+                 channels: int = 1,
+                 ):
         """
         Initialize audio capture.
 
@@ -36,6 +40,7 @@ class AudioCapture:
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.channels = channels
+        self.event_bus = event_bus
 
         # Initialize components
         self.device_manager = DeviceManager()
@@ -85,6 +90,14 @@ class AudioCapture:
             self.is_running = True
             self._callback = callback
 
+            # Public event on start
+            await self.event_bus.publish(Event(
+                type=EventType.AUDIO_CHUNK,
+                data={
+                    "status": "capture_started",
+                }
+            ))
+
             # Start processing loop
             asyncio.create_task(self._process_audio())
 
@@ -95,7 +108,12 @@ class AudioCapture:
     async def stop_capture(self) -> None:
         """Stop capturing audio and clean up resources."""
         self.is_running = False
-
+        await self.event_bus.publish(Event(
+            type=EventType.AUDIO_CHUNK,
+            data={
+                "status": "capture_stopped",
+            }
+        ))
         # Clean up streams
         for stream in self._streams.values():
             try:
@@ -178,6 +196,15 @@ class AudioCapture:
                 # Call callback if set
                 if self._callback:
                     await self._callback(result)
+
+                # Publish an event for each processed chunk
+                await self.event_bus.publish(Event(
+                    type=EventType.AUDIO_CHUNK,
+                    data={
+                        "status": "processed_chunk",
+                        "result": result
+                    }
+                ))
 
                 # Small delay to prevent CPU overload
                 await asyncio.sleep(0.001)

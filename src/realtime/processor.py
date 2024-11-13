@@ -1,366 +1,437 @@
-from typing import Dict, Any, Optional
-import asyncio
+from typing import Dict, Any, Optional, AsyncIterator, Callable
 from datetime import datetime
-import time
+import asyncio
+import logging
 
-from ..audio.capture import AudioCapture
-from ..transcription.aws_transcribe import TranscribeManager
+from ..conversation.types import (
+    Role,
+    StreamResponse,
+    BedrockConfig,
+    DocumentFormat,
+    MessageRole
+)
+from ..conversation.context import ConversationContext
 from ..conversation.manager import ConversationManager
-from ..assistance.enhanced_assistant import ConversationAssistant, Role
+from ..transcription.aws_transcribe import TranscribeManager
 from ..events.bus import EventBus, Event, EventType
+from ..assistance.enhanced_assistant import AssistanceResponse
+from ..conversation.exceptions import ConversationError
+
+logger = logging.getLogger(__name__)
 
 
 class RealtimeProcessor:
-    """Manages real-time audio processing, transcription, and assistance."""
+    """Manages real-time processing with role-based context and streaming."""
 
     def __init__(
-        self,
-        event_bus: EventBus,
-        conversation_manager: ConversationManager,
-        transcribe_manager: TranscribeManager,
-        role: Role
-    ):
+            self,
+            event_bus: EventBus,
+            conversation_manager: ConversationManager,
+            transcribe_manager: TranscribeManager,
+            role: Role,
+            **kwargs
+    ) -> None:
         """Initialize realtime processor.
 
         Args:
-            event_bus: Event bus for real-time processing
-            conversation_manager: Conversation manager for real-time processing
-            transcribe_manager: Transcribe manager for real-time processing
-            role: User's role in conversation
+            event_bus: Event bus for real-time coordination
+            conversation_manager: Conversation manager
+            transcribe_manager: Transcription manager
+            role: User's role
+            **kwargs: Optional callback functions:
+                     - on_transcript(str)
+                     - on_assistance(AssistanceResponse)
+                     - on_tool_use(Dict)
+                     - on_error(str)
+                     - on_metrics(Dict)
         """
         self.event_bus = event_bus
         self.conversation = conversation_manager
         self.transcribe = transcribe_manager
-        self.role = role
-        self.is_running = False
+        self.context = ConversationContext(role)
+        self.callbacks = kwargs
 
-        # Subscribe to relevant events
-        self.event_bus.subscribe(
-            EventType.AUDIO_CHUNK,
-            self._handle_audio_chunk,
-            {self.role}
-        )
-        self.event_bus.subscribe(
-            EventType.TRANSCRIPTION,
-            self._handle_transcription,
-            {self.role}
-        )
-        self.event_bus.subscribe(
-            EventType.CONTEXT_UPDATE,
-            self._handle_context_update,
-            {self.role}
-        )
+        # State tracking
+        self.is_running = False
+        self.current_speaker: Optional[str] = None
+        self.last_analysis_time: Optional[float] = None
+        self.analysis_interval = 1.0  # seconds
+        self.stream_buffer = []
+
+        # Performance metrics
+        self.metrics = {
+            "processed_chunks": 0,
+            "transcripts_generated": 0,
+            "responses_generated": 0,
+            "tools_used": 0,
+            "errors": 0,
+            "latency": []
+        }
+
+        # Set up error handling
+        self.event_bus.add_error_handler(self._handle_error)
 
     async def start(
-        self,
-        region: str,
-        mic_device_id: Optional[int] = None,
-        desktop_device_id: Optional[int] = None
+            self,
+            audio_config: Optional[Dict[str, Any]] = None,
+            model_config: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Start real-time processing."""
+        """Start real-time processing.
+
+        Args:
+            audio_config: Optional audio configuration
+            model_config: Optional model configuration
+        """
         try:
-            # Initialize audio capture
-            self.audio_capture = AudioCapture(
-                mic_device_id=mic_device_id,
-                desktop_device_id=desktop_device_id
-            )
-
-            # Initialize managers
-            self.transcribe_manager = TranscribeManager(region=region)
-            self.conversation_manager = ConversationManager(
-                region=region,
-                model_id="anthropic.claude-3-sonnet-20240229-v1:0"
-            )
-
-            # Initialize assistant
-            self.assistant = ConversationAssistant(
-                self.conversation_manager,
-                role=self.role,
-                context_type="interview"
-            )
-
-            # Start capture
-            await self.audio_capture.start_capture()
-
-            # Start processing
             self.is_running = True
-            await self._process_audio_stream()
+
+            # Initialize transcription
+            await self.transcribe.start_stream()
+
+            # Set up event handlers
+            self.event_bus.subscribe(
+                EventType.AUDIO_CHUNK,
+                self._handle_audio_chunk
+            )
+            self.event_bus.subscribe(
+                EventType.TRANSCRIPT,
+                self._handle_transcript
+            )
+            self.event_bus.subscribe(
+                EventType.CONTEXT_UPDATE,
+                self._handle_context_update
+            )
+
+            # Notify start
+            await self._emit_event(
+                EventType.STATUS,
+                {
+                    "status": "started",
+                    "role": self.context.role.value,
+                    "config": {
+                        "audio": audio_config,
+                        "model": model_config
+                    }
+                }
+            )
 
         except Exception as e:
-            if self.on_error:
-                await self._call_callback(self.on_error, str(e))
+            self.metrics["errors"] += 1
+            await self._handle_error(Event(
+                type=EventType.ERROR,
+                data={"message": f"Start error: {str(e)}"},
+                timestamp=datetime.now()
+            ))
             raise
 
     async def stop(self) -> None:
-        """Stop real-time processing."""
-        self.is_running = False
-
-        # Stop audio capture if it exists
-        if self.audio_capture:
-            try:
-                await self.audio_capture.stop_capture()
-            finally:
-                # Clear references only after stopping
-                self.audio_capture = None
-
-        # Clear other components
-        self.transcribe_manager = None
-        self.conversation_manager = None
-        self.assistant = None
-
-    async def add_context(
-        self,
-        content: Any,
-        doc_type: str,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Add context document for processing."""
-        if self.assistant:
-            await self.assistant.add_document(content, doc_type, metadata)
-
-    async def _process_audio_stream(self) -> None:
-        """Process audio stream in real-time."""
+        """Stop real-time processing and cleanup."""
         try:
-            while self.is_running:
-                if not self.audio_capture:
-                    break
-
-                chunk = await self.audio_capture._read_stream()
-                if chunk:
-                    await self._process_chunk(chunk)
-
-                # Small delay to prevent CPU overload
-                await asyncio.sleep(0.001)
-
-        except Exception as e:
             self.is_running = False
-            if self.on_error:
-                await self._call_callback(self.on_error, str(e))
-            raise
 
-    async def _get_audio_chunk(self) -> Optional[bytes]:
-        """Get next audio chunk."""
-        try:
-            # Read from audio capture
-            chunk = await self.audio_capture._read_stream('mic')
-            if chunk is None:
-                return None
+            # Stop transcription
+            await self.transcribe.stop_stream()
 
-            # Get audio levels for speaker detection
-            levels = await self.audio_capture.get_audio_levels()
-            self._update_speaker(levels)
-
-            return chunk
-
-        except Exception as e:
-            if self.on_error:
-                self.on_error(f"Error getting audio chunk: {e}")
-            return None
-
-    async def _process_chunk(self, chunk: bytes) -> None:
-        """Process a single chunk of audio data.
-
-        Args:
-            chunk: Raw audio data to process
-        """
-        try:
-            # Process audio through transcription
-            transcript = await self.transcribe_manager.process_audio(chunk)
-
-            # Call transcript callback if we have a transcript
-            if transcript and self.on_transcript:
-                # Ensure we await the callback
-                await self._call_callback(self.on_transcript, transcript)
-
-            # Check if we should run analysis
-            current_time = time.time()
-            should_analyze = (
-                self.last_analysis_time is None or
-                current_time - self.last_analysis_time >=
-                self.analysis_interval
+            # Unsubscribe from events
+            self.event_bus.unsubscribe(
+                EventType.AUDIO_CHUNK,
+                self._handle_audio_chunk
+            )
+            self.event_bus.unsubscribe(
+                EventType.TRANSCRIPT,
+                self._handle_transcript
+            )
+            self.event_bus.unsubscribe(
+                EventType.CONTEXT_UPDATE,
+                self._handle_context_update
             )
 
-            # Process through conversation if
-            # we have a transcript and should analyze
-            if transcript and should_analyze:
-                await self._process_conversation(transcript)
-                self.last_analysis_time = current_time
-
-        except Exception as e:
-            if self.on_error:
-                await self._call_callback(self.on_error, str(e))
-
-    async def _process_conversation(self, transcript: str) -> None:
-        """Process transcript through conversation manager.
-
-        Args:
-            transcript: Text to process
-        """
-        try:
-            if self.conversation_manager:
-                # Process through conversation manager
-                async for response in\
-                        self.conversation_manager.process_message(transcript):
-                    if self.on_suggestion and response.get('suggestion'):
-                        await self._call_callback(
-                            self.on_suggestion,
-                            response['suggestion']
-                        )
-                    if self.on_analysis and response.get('analysis'):
-                        await self._call_callback(
-                            self.on_analysis,
-                            response['analysis']
-                        )
-        except Exception as e:
-            if self.on_error:
+            # Final metrics
+            if "on_metrics" in self.callbacks:
                 await self._call_callback(
-                    self.on_error,
-                    f"Conversation error: {str(e)}"
+                    "on_metrics",
+                    self.metrics
                 )
 
-    async def _call_callback(self, callback, data):
-        """Safely execute a callback function.
+            # Notify stop
+            await self._emit_event(
+                EventType.STATUS,
+                {
+                    "status": "stopped",
+                    "metrics": self.metrics
+                }
+            )
+
+        except Exception as e:
+            self.metrics["errors"] += 1
+            await self._handle_error(Event(
+                type=EventType.ERROR,
+                data={"message": f"Stop error: {str(e)}"},
+                timestamp=datetime.now()
+            ))
+
+    async def add_document(
+            self,
+            path: str,
+            doc_type: str,
+            metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Add document to conversation context.
 
         Args:
-            callback: Callback function to execute
-            data: Data to pass to callback
+            path: Path to document
+            doc_type: Document type
+            metadata: Optional metadata
         """
         try:
-            if asyncio.iscoroutinefunction(callback):
-                await callback(data)
-            else:
-                # For non-async callbacks, run in executor to prevent blocking
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, callback, data)
-        except Exception as e:
-            if self.on_error and callback != self.on_error:
-                await self._call_callback(
-                    self.on_error,
-                    f"Callback error: {str(e)}"
-                )
+            # Add to context
+            document = await self.context.add_document(
+                path,
+                doc_type,
+                metadata
+            )
 
-    def _update_speaker(self, levels: Dict[str, float]) -> None:
-        """Update current speaker based on audio levels."""
-        mic_level = levels.get('mic', float('-inf'))
-        desktop_level = levels.get('desktop', float('-inf'))
-
-        # Simple threshold-based speaker detection
-        if mic_level > -30 and mic_level > desktop_level + 10:
-            self.current_speaker = 'local'
-        elif desktop_level > -30 and desktop_level > mic_level + 10:
-            self.current_speaker = 'remote'
-        else:
-            self.current_speaker = None
-
-    def _should_run_analysis(self) -> bool:
-        """Determine if we should run analysis now."""
-        now = datetime.now()
-        if not self.last_analysis_time:
-            self.last_analysis_time = now
-            return True
-
-        time_diff = (now - self.last_analysis_time).total_seconds()
-        if time_diff >= self.analysis_interval:
-            self.last_analysis_time = now
-            return True
-
-        return False
-
-    async def _run_analysis(self, transcript: str) -> None:
-        """Run analysis on current transcript."""
-        try:
-            analysis = await self.assistant.analyze_response(transcript)
-
-            if self.on_analysis:
-                self.on_analysis({
-                    'analysis': analysis,
-                    'timestamp': datetime.now().isoformat()
-                })
+            # Notify document added
+            await self._emit_event(
+                EventType.DOCUMENT_ADDED,
+                {
+                    "name": document.name,
+                    "type": document.mime_type,
+                    "metadata": metadata
+                }
+            )
 
         except Exception as e:
-            if self.on_error:
-                self.on_error(f"Analysis error: {e}")
-
-    async def _get_suggestions(self, transcript: str) -> None:
-        """Get and send real-time suggestions."""
-        try:
-            async for suggestion in self.assistant.get_suggestions(transcript):
-                if self.on_suggestion:
-                    self.on_suggestion({
-                        'suggestion': suggestion.text,
-                        'type': 'real-time',
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-        except Exception as e:
-            if self.on_error:
-                self.on_error(f"Suggestion error: {e}")
+            self.metrics["errors"] += 1
+            await self._handle_error(Event(
+                type=EventType.ERROR,
+                data={"message": f"Document error: {str(e)}"},
+                timestamp=datetime.now()
+            ))
 
     async def _handle_audio_chunk(self, event: Event) -> None:
-        """Process audio chunk and generate transcription."""
-        if not self.is_running:
-            return
+        """Process audio chunk events.
 
-        result = await self.transcribe.process_audio(event.data)
-        if result:
-            await self.event_bus.publish(Event(
-                type=EventType.TRANSCRIPTION,
-                data=result.text,
-                timestamp=datetime.now(),
-                role=self.role
-            ))
-
-    async def _handle_transcription(self, event: Event) -> None:
-        """Process transcription and generate assistance."""
+        Args:
+            event: Audio chunk event
+        """
         if not self.is_running:
             return
 
         try:
-            async for response in self.conversation.process_realtime(
-                event.data,
-                self.role
-            ):
-                await self.event_bus.publish(Event(
-                    type=EventType.ASSISTANCE,
-                    data=response,
-                    timestamp=datetime.now(),
-                    role=self.role
-                ))
+            start_time = datetime.now().timestamp()
+            self.metrics["processed_chunks"] += 1
+
+            # Process audio
+            transcript = await self.transcribe.process_audio(
+                event.data["audio"]
+            )
+
+            if transcript:
+                self.metrics["transcripts_generated"] += 1
+                self.stream_buffer.append(transcript)
+
+                # Calculate latency
+                latency = datetime.now().timestamp() - start_time
+                self.metrics["latency"].append(latency)
+
+                # Publish transcript
+                await self._emit_event(
+                    EventType.TRANSCRIPT,
+                    {
+                        "text": transcript,
+                        "speaker": self.current_speaker,
+                        "latency": latency
+                    }
+                )
+
+                # Callback
+                await self._call_callback(
+                    "on_transcript",
+                    transcript
+                )
+
         except Exception as e:
-            await self.event_bus.publish(Event(
+            self.metrics["errors"] += 1
+            await self._handle_error(Event(
                 type=EventType.ERROR,
-                data=str(e),
-                timestamp=datetime.now(),
-                role=self.role,
-                metadata={"stage": "assistance"}
+                data={"message": f"Audio error: {str(e)}"},
+                timestamp=datetime.now()
             ))
+
+    async def _handle_transcript(self, event: Event) -> None:
+        """Process transcript events with role-based responses.
+
+        Args:
+            event: Transcript event
+        """
+        if not self.is_running:
+            return
+
+        try:
+            current_time = datetime.now().timestamp()
+            should_analyze = (
+                    self.last_analysis_time is None or
+                    current_time - self.last_analysis_time >=
+                    self.analysis_interval
+            )
+
+            if should_analyze:
+                self.last_analysis_time = current_time
+                system_messages = self.context.system_prompts
+
+                # Get streaming response
+                async for response in self.conversation.send_message(
+                        event.data["text"],
+                        system_messages=system_messages
+                ):
+                    self.metrics["responses_generated"] += 1
+
+                    # Handle content
+                    if response.content and response.content.text:
+                        await self._emit_event(
+                            EventType.ASSISTANCE,
+                            {
+                                "type": "suggestion",
+                                "content": response.content.text,
+                                "role": self.context.role.value,
+                                "context": {
+                                    "speaker": event.data.get("speaker"),
+                                    "latency": event.data.get("latency")
+                                }
+                            }
+                        )
+
+                        await self._call_callback(
+                            "on_assistance",
+                            AssistanceResponse(
+                                suggestion=response.content.text,
+                                confidence=0.9,
+                                context={
+                                    "role": self.context.role.value,
+                                    "speaker": event.data.get("speaker")
+                                },
+                                timestamp=datetime.now()
+                            )
+                        )
+
+                    # Handle tool use
+                    if response.content and response.content.tool_use:
+                        self.metrics["tools_used"] += 1
+                        await self._handle_tool_use(
+                            response.content.tool_use
+                        )
+
+                    # Handle metadata
+                    if response.metadata:
+                        await self._emit_event(
+                            EventType.METRICS,
+                            response.metadata.model_dump()
+                        )
+
+        except Exception as e:
+            self.metrics["errors"] += 1
+            await self._handle_error(Event(
+                type=EventType.ERROR,
+                data={"message": f"Transcript error: {str(e)}"},
+                timestamp=datetime.now()
+            ))
+
+    async def _handle_tool_use(self, tool_use: Dict[str, Any]) -> None:
+        """Handle tool use responses.
+
+        Args:
+            tool_use: Tool use data
+        """
+        await self._emit_event(
+            EventType.TOOL_USE,
+            tool_use
+        )
+
+        await self._call_callback(
+            "on_tool_use",
+            tool_use
+        )
 
     async def _handle_context_update(self, event: Event) -> None:
-        """Handle context updates during conversation."""
-        if not self.is_running:
-            return
+        """Handle context update events.
 
+        Args:
+            event: Context update event
+        """
         try:
-            # Update conversation context
-            await self.conversation.update_context(event.data)
+            if "document" in event.data:
+                await self.add_document(**event.data["document"])
+            elif "system_prompt" in event.data:
+                await self.context.add_system_prompt(
+                    event.data["system_prompt"]
+                )
 
-            # Generate new assistance based on updated context
-            async for response in self.conversation.process_realtime(
-                "",  # Empty string triggers context-only analysis
-                self.role
-            ):
-                await self.event_bus.publish(Event(
-                    type=EventType.ASSISTANCE,
-                    data=response,
-                    timestamp=datetime.now(),
-                    role=self.role,
-                    metadata={"trigger": "context_update"}
-                ))
         except Exception as e:
-            await self.event_bus.publish(Event(
+            self.metrics["errors"] += 1
+            await self._handle_error(Event(
                 type=EventType.ERROR,
-                data=str(e),
-                timestamp=datetime.now(),
-                role=self.role,
-                metadata={"stage": "context_update"}
+                data={"message": f"Context error: {str(e)}"},
+                timestamp=datetime.now()
             ))
+
+    async def _handle_error(self, event: Event) -> None:
+        """Handle errors with proper logging and notification.
+
+        Args:
+            event: Error event
+        """
+        error_msg = event.data["message"]
+        logger.error(error_msg)
+
+        # Callback
+        await self._call_callback(
+            "on_error",
+            error_msg
+        )
+
+    async def _emit_event(
+            self,
+            event_type: EventType,
+            data: Dict[str, Any]
+    ) -> None:
+        """Emit event with proper structure.
+
+        Args:
+            event_type: Type of event
+            data: Event data
+        """
+        await self.event_bus.publish(Event(
+            type=event_type,
+            data=data,
+            timestamp=datetime.now(),
+            role=self.context.role,
+            metadata={"processor_id": id(self)}
+        ))
+
+    async def _call_callback(
+            self,
+            name: str,
+            data: Any
+    ) -> None:
+        """Safely execute callback if it exists.
+
+        Args:
+            name: Callback name
+            data: Data for callback
+        """
+        if name in self.callbacks:
+            try:
+                callback = self.callbacks[name]
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(data)
+                else:
+                    callback(data)
+            except Exception as e:
+                await self._handle_error(Event(
+                    type=EventType.ERROR,
+                    data={
+                        "message": f"Callback error ({name}): {str(e)}"
+                    },
+                    timestamp=datetime.now()
+                ))

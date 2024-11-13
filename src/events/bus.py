@@ -1,62 +1,38 @@
-from enum import Enum
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, Any, Set, Callable, Optional
+# src/events/bus.py
+from typing import Dict, Set, Callable, Coroutine, Any
+import asyncio
+import logging
+from types import Event, EventType
 
-from src.conversation.roles import Role
+logger = logging.getLogger(__name__)
 
-
-class EventType(Enum):
-    AUDIO_CHUNK = "audio_chunk"
-    TRANSCRIPTION = "transcription"
-    ASSISTANCE = "assistance"
-    CONTEXT_UPDATE = "context_update"
-    DOCUMENT_PROCESSED = "document_processed"
-    ERROR = "error"
-
-
-@dataclass
-class Event:
-    type: EventType
-    data: Any
-    timestamp: datetime
-    role: Optional[Role] = None
-    metadata: Optional[Dict[str, Any]] = None
-
+CallbackType = Callable[[Event], Coroutine[Any, Any, None]]
 
 class EventBus:
-    def __init__(self):
-        self._subscribers: Dict[EventType, Set[Callable]] = {
-            event_type: set() for event_type in EventType
-        }
-        self._role_filters: Dict[Callable, Set[Role]] = {}
+    def __init__(self) -> None:
+        self._subscribers: Dict[EventType, Set[CallbackType]] = {event: set() for event in EventType}
+        self._queue = asyncio.Queue()
+
+    def subscribe(self, event_type: EventType, callback: CallbackType) -> None:
+        """Subscribe to an event type."""
+        self._subscribers[event_type].add(callback)
+
+    def unsubscribe(self, event_type: EventType, callback: CallbackType) -> None:
+        """Unsubscribe from an event type."""
+        self._subscribers[event_type].discard(callback)
 
     async def publish(self, event: Event) -> None:
-        """Publish event to relevant subscribers."""
-        subscribers = self._subscribers[event.type]
+        """Publish an event to all subscribers asynchronously."""
+        await self._queue.put(event)
 
-        for subscriber in subscribers:
-            if (event.role and
-                subscriber in self._role_filters and
-                    event.role not in self._role_filters[subscriber]):
-                continue
-
-            try:
-                await subscriber(event)
-            except Exception as e:
-                await self.publish(Event(
-                    type=EventType.ERROR,
-                    data=str(e),
-                    timestamp=datetime.now(),
-                    metadata={"original_event": event.type.value}
-                ))
-
-    def subscribe(
-        self,
-        event_type: EventType,
-        callback: Callable,
-        roles: Optional[Set[Role]] = None
-    ) -> None:
-        self._subscribers[event_type].add(callback)
-        if roles:
-            self._role_filters[callback] = roles
+    async def start(self) -> None:
+        """Start processing events from the queue."""
+        while True:
+            event = await self._queue.get()
+            if event.type in self._subscribers:
+                for callback in self._subscribers[event.type]:
+                    try:
+                        await callback(event)
+                    except Exception as e:
+                        logger.error(f"Error in {callback}: {e}")
+            self._queue.task_done()

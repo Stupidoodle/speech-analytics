@@ -1,368 +1,486 @@
+import aiofiles
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from dataclasses import dataclass
-import json
-import mimetypes
 from pathlib import Path
-import aiofiles
-from enum import Enum
 
-from .manager import ConversationManager
+from .types import (
+    Role,
+    Document,
+    DocumentFormat,
+)
 
 from .exceptions import (
-    StreamError,
-    ValidationError,
-    ServiceError,
-    DocumentError
+    DocumentError,
 )
 
 
-class ConversationState(Enum):
-    INITIAL = "initial"
-    ACTIVE = "active"
-    WAITING_RESPONSE = "waiting_response"
-    FOLLOW_UP = "follow_up"
-    CLARIFICATION = "clarification"
-    CONCLUDING = "concluding"
-
-
-@dataclass
-class ConversationTurn:
-    speaker: str
-    content: str
-    timestamp: datetime
-    state: ConversationState
-    context: Dict[str, Any]
-    analysis: Optional[Dict[str, Any]] = None
-
-
 class ConversationContext:
-    """Manages context data for conversations."""
+    """Manages conversation context, documents, and role-specific behavior."""
 
-    def __init__(self, conversation_manager: ConversationManager):
-        """Initialize conversation context."""
-        self.ai = conversation_manager
-        self.files: Dict[str, Dict[str, Any]] = {}
-        self.structured_data: Dict[str, List[Dict[str, Any]]] = {}
+    def __init__(self, role: Role) -> None:
+        """Initialize conversation context.
+
+        Args:
+            role: User's role in conversation
+        """
+        self.role = role
+        self.documents: Dict[str, Document] = {}
+        self.system_prompts: List[Dict[str, Any]] = []
         self.metadata: Dict[str, Any] = {}
-        self.turns: List[ConversationTurn] = []
-        self.current_state = ConversationState.INITIAL
-        self.context_history: List[Dict[str, Any]] = []
-        self.active_topics: List[str] = []
-        self._file_handlers = {
-            'application/pdf': self._handle_pdf,
-            'text/plain': self._handle_text,
-            'application/json': self._handle_json,
-            'text/csv': self._handle_csv,
-            'application/vnd.openxmlformats-officedocument.wordprocessingml'
-            '.document': self._handle_docx
+
+        # Add role-specific system prompt
+        self._add_role_prompt()
+
+    def _add_role_prompt(self) -> None:
+        """Add role-specific system prompt and behaviors."""
+
+        prompts = {
+            Role.INTERVIEWER: """You are conducting an interview. Focus on:
+            - Evaluating candidate responses against requirements
+            - Asking targeted follow-up questions
+            - Assessing technical and soft skills
+            - Maintaining structured interview flow
+            - Documenting key insights and red flags
+            - Referencing CV and job requirements
+            - Ensuring all key areas are covered
+            - Providing clear transitions between topics""",
+            Role.INTERVIEWEE: """You are a job candidate in an interview. Focus on:
+            - Providing clear, structured responses
+            - Using the STAR method for experience examples
+            - Demonstrating relevant skills and experience
+            - Showing enthusiasm and cultural fit
+            - Asking insightful questions about the role
+            - Connecting experience to job requirements
+            - Highlighting unique value proposition
+            - Maintaining professional communication
+            - Following up on interviewer's questions""",
+            Role.SUPPORT_AGENT: """You are providing customer support. Focus on:
+            - Understanding customer issues thoroughly
+            - Providing clear, step-by-step solutions
+            - Maintaining empathetic communication
+            - Following established procedures
+            - Documenting issue resolution
+            - Escalating when appropriate
+            - Referencing relevant documentation
+            - Ensuring customer satisfaction
+            - Following up on resolution""",
+            Role.CUSTOMER: """You are seeking customer support. Focus on:
+            - Clearly describing your issue or need
+            - Providing relevant context and details
+            - Following troubleshooting instructions
+            - Asking clarifying questions
+            - Confirming understanding
+            - Expressing concerns clearly
+            - Testing proposed solutions
+            - Providing feedback on resolution""",
+            Role.MEETING_HOST: """You are hosting a meeting. Focus on:
+            - Managing meeting flow and timing
+            - Ensuring participant engagement
+            - Keeping discussion on track
+            - Documenting key decisions
+            - Assigning action items
+            - Facilitating effective discussion
+            - Managing time for each agenda item
+            - Summarizing key points
+            - Ensuring clear next steps
+            - Following up on action items""",
+            Role.MEETING_PARTICIPANT: """You are participating in a meeting. Focus on:
+            - Contributing relevant insights
+            - Staying on topic
+            - Respecting time allocations
+            - Taking notes on key points
+            - Volunteering for action items
+            - Asking clarifying questions
+            - Supporting meeting objectives
+            - Following up on commitments
+            - Engaging constructively"""
         }
 
-    async def add_file(
-        self,
-        file_path: str,
-        file_type: str,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Add a file to the conversation context.
+        # Add base role prompt
+        if self.role in prompts:
+            self.system_prompts.append({
+                "text": prompts[self.role],
+                "metadata": {"type": "role_prompt"}
+            })
+
+        # Add role-specific behaviors
+        behaviors = self._get_role_behaviors()
+        if behaviors:
+            self.system_prompts.append({
+                "text": behaviors,
+                "metadata": {"type": "role_behaviors"}
+            })
+
+    def _get_role_behaviors(self) -> Optional[str]:
+        """Get role-specific behaviors and guidelines."""
+        behaviors = {
+            Role.INTERVIEWER: """Behavioral Guidelines:
+            1. Time Management:
+               - Keep questions focused and relevant
+               - Allow adequate response time
+               - Maintain interview schedule
+        
+            2. Assessment:
+               - Use behavioral questioning techniques
+               - Look for specific examples
+               - Compare against job requirements
+               - Document candidate responses
+        
+            3. Communication:
+               - Use clear, professional language
+               - Provide smooth transitions
+               - Give clear instructions
+               - Maintain neutral tone
+        
+            4. Documentation:
+               - Note key qualifications
+               - Record red flags
+               - Track required skill coverage
+               - Document follow-up items""",
+            Role.INTERVIEWEE: """Behavioral Guidelines:
+            1. Response Structure:
+               - Use STAR method (Situation, Task, Action, Result)
+               - Provide specific examples
+               - Keep responses focused
+               - Highlight achievements
+        
+            2. Professional Conduct:
+               - Maintain positive attitude
+               - Show active listening
+               - Express genuine interest
+               - Demonstrate preparation
+        
+            3. Question Handling:
+               - Ask for clarification if needed
+               - Take time to formulate responses
+               - Provide relevant context
+               - Connect answers to role
+        
+            4. Follow-up:
+               - Note areas for elaboration
+               - Remember questions to ask
+               - Track discussion points
+               - Show initiative""",
+            Role.SUPPORT_AGENT: """Behavioral Guidelines:
+            1. Issue Resolution:
+               - Follow troubleshooting steps
+               - Document all actions taken
+               - Verify resolution
+               - Set clear expectations
+        
+            2. Communication:
+               - Use clear, simple language
+               - Show empathy and patience
+               - Provide progress updates
+               - Confirm understanding
+        
+            3. Documentation:
+               - Record all interactions
+               - Note solution steps
+               - Track issue status
+               - Document follow-up needs
+        
+            4. Escalation:
+               - Know escalation criteria
+               - Follow escalation procedures
+               - Keep customer informed
+               - Track escalated issues""",
+            Role.CUSTOMER: """Behavioral Guidelines:
+            1. Issue Reporting:
+               - Describe problem clearly
+               - Provide relevant details
+               - Follow instructions
+               - Report outcomes
+        
+            2. Communication:
+               - Stay focused on issue
+               - Ask for clarification
+               - Provide feedback
+               - Maintain patience
+        
+            3. Solution Testing:
+               - Follow steps exactly
+               - Report results clearly
+               - Note any issues
+               - Confirm resolution
+        
+            4. Follow-up:
+               - Document solution
+               - Track issue status
+               - Keep reference numbers
+               - Note contact points""",
+            Role.MEETING_HOST: """Behavioral Guidelines:
+            1. Meeting Management:
+               - Follow agenda strictly
+               - Manage time effectively
+               - Ensure participation
+               - Document decisions
+        
+            2. Facilitation:
+               - Encourage discussion
+               - Manage conflicts
+               - Keep focus on goals
+               - Drive to outcomes
+        
+            3. Documentation:
+               - Record key decisions
+               - Track action items
+               - Note agreements
+               - Capture next steps
+        
+            4. Follow-up:
+               - Distribute minutes
+               - Track action items
+               - Schedule follow-ups
+               - Monitor progress""",
+            Role.MEETING_PARTICIPANT: """Behavioral Guidelines:
+            1. Participation:
+               - Come prepared
+               - Stay engaged
+               - Contribute constructively
+               - Respect time limits
+        
+            2. Communication:
+               - Be clear and concise
+               - Listen actively
+               - Support discussion flow
+               - Ask relevant questions
+        
+            3. Documentation:
+               - Take personal notes
+               - Track commitments
+               - Record decisions
+               - Note action items
+        
+            4. Follow-up:
+               - Complete assigned tasks
+               - Report progress
+               - Share relevant updates
+               - Meet deadlines"""
+        }
+
+        return behaviors.get(self.role)
+
+    async def add_document(
+            self,
+            path: str,
+            doc_type: str,
+            metadata: Optional[Dict[str, Any]] = None
+    ) -> Document:
+        """Add document to context.
 
         Args:
-            file_path: Path to the file
-            file_type: Type of context (e.g., 'cv', 'document')
-            metadata: Additional metadata about the file
+            path: Path to document
+            doc_type: Type of document (e.g., 'cv', 'spec')
+            metadata: Optional document metadata
+
+        Returns:
+            Processed document
+
+        Raises:
+            DocumentError: On document processing errors
         """
         try:
-            path = Path(file_path)
-            if not path.exists():
-                raise DocumentError(f"File not found: {file_path}")
+            # Read document
+            doc_path = Path(path)
+            if not doc_path.exists():
+                raise DocumentError(f"Document not found: {path}")
 
-            mime_type = mimetypes.guess_type(file_path)[0]
-            if not mime_type:
-                raise ValidationError(f"Unsupported file type: {file_path}")
-
-            handler = self._file_handlers.get(mime_type)
-            if not handler:
-                raise ServiceError(f"No handler for mime type: {mime_type}")
-
-            content = await handler(path)
-
-            self.files[str(path)] = {
-                'content': content,
-                'type': file_type,
-                'mime_type': mime_type,
-                'metadata': metadata or {},
-                'added_at': str(datetime.now())
+            # Determine format
+            format_map = {
+                ".pdf": DocumentFormat.PDF,
+                ".csv": DocumentFormat.CSV,
+                ".doc": DocumentFormat.DOC,
+                ".docx": DocumentFormat.DOCX,
+                ".txt": DocumentFormat.TXT,
+                ".md": DocumentFormat.MD
             }
+            doc_format = format_map.get(doc_path.suffix.lower())
+            if not doc_format:
+                raise DocumentError(f"Unsupported format: {doc_path.suffix}")
 
-        except DocumentError as e:
-            raise e
-        except ValidationError as e:
-            raise e
-        except ServiceError as e:
-            raise e
-        except Exception as e:
-            raise StreamError(f"Failed to add file {file_path}: {e}")
+            # Read content
+            content = await self._read_file(doc_path)
 
-    async def add_data(
-        self,
-        data: Dict[str, Any],
-        category: str,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Add structured data to the context.
-
-        Args:
-            data: Data dictionary to add
-            category: Category of the data
-            metadata: Additional metadata about the data
-        """
-        if category not in self.structured_data:
-            self.structured_data[category] = []
-
-        self.structured_data[category].append({
-            'data': data,
-            'metadata': metadata or {},
-            'added_at': str(datetime.now())
-        })
-
-    def get_formatted_context(self) -> str:
-        """Get formatted context string for model input."""
-        context_parts = []
-
-        # Add file contexts
-        for file_path, file_info in self.files.items():
-            context_parts.append(
-                f"Context from {file_info['type']} "
-                f"({Path(file_path).name}):\n"
-                f"{file_info['content']}\n"
+            # Create document
+            document = Document(
+                content=content,
+                mime_type=doc_format.value,
+                name=doc_path.name,
+                metadata=metadata or {}
             )
 
-        # Add structured data contexts
-        for category, items in self.structured_data.items():
-            for item in items:
-                context_parts.append(
-                    f"Additional {category} information:\n"
-                    f"{json.dumps(item['data'], indent=2)}\n"
-                )
+            # Store document
+            doc_id = f"{doc_type}_{datetime.now().isoformat()}"
+            self.documents[doc_id] = document
 
-        return "\n".join(context_parts) if context_parts else ""
+            # Add document prompt based on type
+            await self._add_document_prompt(document, doc_type)
 
-    def get_context_summary(self) -> Dict[str, Any]:
-        """Get summary of all context data used."""
-        return {
-            'files': [
-                {
-                    'path': str(path),
-                    'type': info['type'],
-                    'mime_type': info['mime_type'],
-                    'metadata': info['metadata']
-                }
-                for path, info in self.files.items()
-            ],
-            'structured_data': [
-                {
-                    'category': category,
-                    'count': len(items),
-                    'metadata': [item['metadata'] for item in items]
-                }
-                for category, items in self.structured_data.items()
-            ]
+            return document
+
+        except Exception as e:
+            raise DocumentError(f"Failed to add document: {str(e)}")
+
+    async def _read_file(self, path: Path) -> bytes:
+        """Read file content.
+
+        Args:
+            path: File path
+
+        Returns:
+            File content as bytes
+        """
+        try:
+            async with aiofiles.open(path, mode="rb") as file:
+                content = await file.read()
+            return content
+        except Exception as e:
+            raise DocumentError(f"Failed to read file: {str(e)}")
+
+    async def _add_document_prompt(
+            self,
+            document: Document,
+            doc_type: str
+    ) -> None:
+        """Add document-specific system prompt based on role."""
+        prompts = {
+            # Interviewer Documents
+            ("cv", Role.INTERVIEWER): {
+                "text": """Review the candidate's CV focusing on:
+- Relevant experience and skills
+- Career progression
+- Technical expertise
+- Project achievements
+- Education and certifications
+Use this information to:
+- Ask targeted questions
+- Validate claimed experience
+- Assess skill levels
+- Identify areas for deeper exploration""",
+                "importance": "high"
+            },
+            ("job_description", Role.INTERVIEWER): {
+                "text": """Use this job description to:
+- Assess candidate fit against requirements
+- Focus questions on key skills needed
+- Evaluate technical competencies
+- Gauge culture fit
+- Verify experience levels""",
+                "importance": "high"
+            },
+
+            # Interviewee Documents
+            ("job_description", Role.INTERVIEWEE): {
+                "text": """Review the job description to:
+- Align responses with requirements
+- Highlight relevant experience
+- Demonstrate understanding of role
+- Show enthusiasm for responsibilities
+- Connect skills to needs""",
+                "importance": "high"
+            },
+            ("company_info", Role.INTERVIEWEE): {
+                "text": """Use company information to:
+- Show company research
+- Align with culture
+- Ask informed questions
+- Demonstrate interest""",
+                "importance": "medium"
+            },
+
+            # Support Agent Documents
+            ("manual", Role.SUPPORT_AGENT): {
+                "text": """Reference this manual for:
+- Standard procedures
+- Troubleshooting steps
+- Technical specifications
+- Solution guidelines
+- Escalation criteria""",
+                "importance": "high"
+            },
+            ("ticket_history", Role.SUPPORT_AGENT): {
+                "text": """Review ticket history to:
+- Understand issue context
+- Check previous solutions
+- Avoid duplicate efforts
+- Ensure consistent support""",
+                "importance": "medium"
+            },
+
+            # Customer Documents
+            ("product_manual", Role.CUSTOMER): {
+                "text": """Reference product documentation to:
+- Understand features
+- Follow instructions
+- Verify specifications
+- Check requirements""",
+                "importance": "medium"
+            },
+
+            # Meeting Host Documents
+            ("agenda", Role.MEETING_HOST): {
+                "text": """Use this agenda to:
+- Guide discussion flow
+- Manage time allocation
+- Track completion
+- Ensure coverage
+- Document decisions""",
+                "importance": "high"
+            },
+            ("previous_minutes", Role.MEETING_HOST): {
+                "text": """Review previous minutes to:
+- Follow up on actions
+- Maintain continuity
+- Track progress
+- Update status""",
+                "importance": "medium"
+            },
+
+            # Meeting Participant Documents
+            ("meeting_materials", Role.MEETING_PARTICIPANT): {
+                "text": """Review materials to:
+- Prepare contributions
+- Support discussion
+- Reference data
+- Track decisions""",
+                "importance": "high"
+            }
         }
+
+        # Get prompt for document type and role
+        prompt_info = prompts.get((doc_type, self.role))
+        if prompt_info:
+            self.system_prompts.append({
+                "text": prompt_info["text"],
+                "document": {
+                    "format": document.mime_type,
+                    "name": document.name,
+                    "source": {"bytes": document.content}
+                },
+                "metadata": {
+                    "type": "document_prompt",
+                    "doc_type": doc_type,
+                    "importance": prompt_info["importance"]
+                }
+            })
 
     async def clear_context(
-        self,
-        context_type: Optional[str] = None
+            self,
+            context_type: Optional[str] = None
     ) -> None:
-        """Clear specified type of context or all context."""
-        if context_type == 'files':
-            self.files.clear()
-        elif context_type == 'structured_data':
-            self.structured_data.clear()
+        """Clear specified context type.
+
+        Args:
+            context_type: Type of context to clear ('documents', 'prompts', or None for all)
+        """
+        if context_type == "documents":
+            self.documents.clear()
+        elif context_type == "prompts":
+            self.system_prompts = []
+            self._add_role_prompt()  # Keep role prompt
         elif context_type is None:
-            self.files.clear()
-            self.structured_data.clear()
+            self.documents.clear()
+            self.system_prompts.clear()
             self.metadata.clear()
-
-    async def _handle_text(self, path: Path) -> str:
-        """Handle text file reading."""
-        async with aiofiles.open(path, 'r') as file:
-            return await file.read()
-
-    async def _handle_json(self, path: Path) -> str:
-        """Handle JSON file reading."""
-        async with aiofiles.open(path, 'r') as file:
-            content = await file.read()
-            try:
-                parsed = json.loads(content)
-                return json.dumps(parsed, indent=2)
-            except json.JSONDecodeError as e:
-                raise DocumentError(f"Invalid JSON file {path}: {e}")
-
-    async def _handle_pdf(self, path: Path) -> str:
-        """Handle PDF file reading."""
-        try:
-            # This would use PyPDF2 or similar library
-            # For now, return placeholder
-            return f"[PDF content from {path}]"
-        except Exception as e:
-            raise ServiceError(f"Failed to process PDF {path}: {e}")
-
-    async def _handle_csv(self, path: Path) -> str:
-        """Handle CSV file reading."""
-        try:
-            # This would use pandas or similar library
-            # For now, return placeholder
-            return f"[CSV content from {path}]"
-        except Exception as e:
-            raise ServiceError(f"Failed to process CSV {path}: {e}")
-
-    async def _handle_docx(self, path: Path) -> str:
-        """Handle DOCX file reading."""
-        try:
-            # This would use python-docx or similar library
-            # For now, return placeholder
-            return f"[DOCX content from {path}]"
-        except Exception as e:
-            raise ServiceError(f"Failed to process DOCX {path}: {e}")
-
-    async def add_turn(
-        self,
-        speaker: str,
-        content: str,
-        context: Dict[str, Any]
-    ) -> ConversationTurn:
-        """Add and analyze new conversation turn using AI."""
-        turn = ConversationTurn(
-            speaker=speaker,
-            content=content,
-            timestamp=datetime.now(),
-            state=self.current_state,
-            context=context
-        )
-
-        # Get AI analysis of the turn
-        turn.analysis = await self._analyze_turn(turn)
-
-        self.turns.append(turn)
-        await self._update_state(turn)
-        await self._update_topics(turn)
-        return turn
-
-    async def _analyze_turn(
-        self,
-        turn: ConversationTurn
-    ) -> Dict[str, Any]:
-        """Analyze conversation turn using AI."""
-        recent_context = self.get_recent_context(5)
-        context_str = "\n".join([
-            f"{t.speaker}: {t.content}" for t in recent_context
-        ])
-
-        prompt = (
-            "Analyze this conversation turn in context. "
-            "Provide analysis in JSON format including:\n"
-            "1. Speaker's intent and tone\n"
-            "2. Key points made\n"
-            "3. Relation to previous context\n"
-            "4. Topics discussed\n"
-            "5. Conversation flow impact\n\n"
-            f"Recent context:\n{context_str}\n\n"
-            f"Current turn ({turn.speaker}): {turn.content}"
-        )
-
-        async for response in self.ai.send_message(prompt):
-            if response.text:
-                try:
-                    return json.loads(response.text)
-                except json.JSONDecodeError:
-                    continue
-
-        return {}
-
-    async def _update_state(self, turn: ConversationTurn) -> None:
-        """Update conversation state based on new turn."""
-        if self.current_state == ConversationState.INITIAL:
-            self.current_state = ConversationState.ACTIVE
-        elif '?' in turn.content:
-            self.current_state = ConversationState.WAITING_RESPONSE
-        elif any(
-            phrase in turn.content.lower()
-            for phrase in ['could you clarify', 'what do you mean']
-        ):
-            self.current_state = ConversationState.CLARIFICATION
-        elif len(self.turns) > 10 and any(
-            phrase in turn.content.lower()
-            for phrase in ['thank you', 'goodbye', 'conclude']
-        ):
-            self.current_state = ConversationState.CONCLUDING
-
-    async def _update_topics(self, turn: ConversationTurn) -> None:
-        """Update active topics based on conversation content."""
-        # Extract potential topics from content
-        words = turn.content.lower().split()
-        potential_topics = [
-            w for w in words
-            if len(w) > 4 and w not in self.get_common_words()
-        ]
-
-        # Update active topics
-        self.active_topics.extend(
-            topic for topic in potential_topics
-            if topic not in self.active_topics
-        )
-
-        # Keep only recent topics (last 5)
-        self.active_topics = self.active_topics[-5:]
-
-    def get_recent_context(self, turns: int = 3) -> List[ConversationTurn]:
-        """Get recent conversation turns with context."""
-        return self.turns[-turns:] if self.turns else []
-
-    def get_topic_history(self, topic: str) -> List[ConversationTurn]:
-        """Get all turns related to a specific topic."""
-        return [
-            turn for turn in self.turns
-            if topic.lower() in turn.content.lower()
-        ]
-
-    @staticmethod
-    def get_common_words() -> set:
-        """Get set of common words to filter out."""
-        return {
-            'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have',
-            'i', 'it', 'for', 'not', 'on', 'with', 'he', 'as', 'you',
-            'do', 'at', 'this', 'but', 'his', 'by', 'from', 'they',
-            'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one',
-            'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out',
-            'if', 'about', 'who', 'get', 'which', 'go', 'me'
-        }
-
-    async def get_summary(self) -> Dict[str, Any]:
-        """Get AI-generated conversation summary."""
-        if not self.turns:
-            return {}
-
-        conversation = "\n".join([
-            f"{turn.speaker}: {turn.content}"
-            for turn in self.turns
-        ])
-
-        prompt = (
-            "Provide a comprehensive summary of this conversation. "
-            "Include in JSON format:\n"
-            "1. Main topics discussed\n"
-            "2. Key decisions or conclusions\n"
-            "3. Action items\n"
-            "4. Important insights\n"
-            "5. Follow-up needs\n\n"
-            f"Conversation:\n{conversation}"
-        )
-
-        async for response in self.ai.send_message(prompt):
-            if response.text:
-                try:
-                    return json.loads(response.text)
-                except json.JSONDecodeError:
-                    continue
-
-        return {}
+            self._add_role_prompt()  # Keep role prompt

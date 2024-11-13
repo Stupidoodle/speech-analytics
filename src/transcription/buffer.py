@@ -1,248 +1,277 @@
+"""Audio buffer management for transcription streaming."""
+from typing import Optional, Dict, Any, AsyncIterator
+import asyncio
 from collections import deque
-from typing import Optional, Deque, Tuple
-import time
-from .exceptions import (
-    BufferOverflowError,
-    BufferUnderrunError,
-    InvalidTranscriptionDataError
-)
+from datetime import datetime
+
+from .exceptions import BufferError
+from .types import TranscriptionConfig
+
+from src.events.types import Event, EventType
+from src.events.bus import EventBus
 
 
 class AudioBuffer:
-    """
-    Manages audio buffering for transcription with proper timing and chunking.
-    Ensures audio data is correctly formatted and timed for AWS Transcribe.
-    """
+    """Manages audio buffering for transcription streams."""
 
-    def __init__(self,
-                 max_size: int = 32768,
-                 chunk_size: int = 8192,
-                 sample_rate: int = 16000):
-        """
-        Initialize the audio buffer.
+    def __init__(
+            self,
+            event_bus: EventBus,
+            config: TranscriptionConfig,
+            max_size: int = 32768,  # 32KB default
+            chunk_size: int = 1024  # 1KB chunks
+    ):
+        """Initialize audio buffer.
 
         Args:
+            config: Transcription configuration
             max_size: Maximum buffer size in bytes
             chunk_size: Size of chunks to return in bytes
-            sample_rate: Audio sample rate
         """
+        self.event_bus = event_bus
+        self.config = config
         self.max_size = max_size
         self.chunk_size = chunk_size
-        self.sample_rate = sample_rate
 
-        # Calculate bytes per sample (2 channels * 2 bytes per sample)
-        self.bytes_per_sample = 4
+        # Initialize buffers for each channel
+        self._buffers: Dict[str, deque] = {
+            "combined": deque(),
+            "channel_1": deque(),
+            "channel_2": deque() if config.number_of_channels > 1 else None
+        }
 
-        # Initialize buffer
-        self._buffer: Deque[bytes] = deque()
-        self._buffer_size = 0
+        self._buffer_sizes = {
+            key: 0 for key in self._buffers.keys() if self._buffers[key] is not None
+        }
 
         # Timing management
-        self._last_write_time = time.time()
-        self._last_read_time = time.time()
+        self._last_write: dict[str, Optional[datetime]] = {
+            key: None for key in self._buffers.keys() if self._buffers[key] is not None
+        }
+        self._last_read: dict[str, Optional[datetime]] = {
+            key: None for key in self._buffers.keys() if self._buffers[key] is not None
+        }
 
-    def write(self, data: bytes) -> None:
-        """
-        Write audio data to the buffer.
+        # Statistics
+        self.stats = {
+            "total_bytes_written": 0,
+            "total_bytes_read": 0,
+            "overflow_count": 0,
+            "underrun_count": 0
+        }
+
+    async def write(
+            self,
+            data: bytes,
+            channel: Optional[str] = None
+    ) -> None:
+        """Write audio data to buffer.
 
         Args:
-            data: Raw audio bytes to add to buffer
+            data: Audio data bytes
+            channel: Optional channel identifier
 
         Raises:
-            BufferOverflowError: If buffer would exceed max size
-            InvalidTranscriptionDataError: If data format is invalid
+            BufferError: If buffer would overflow
         """
-        # Validate data
-        if len(data) % self.bytes_per_sample != 0:
-            raise InvalidTranscriptionDataError(
-                "Data length must be a multiple of 4 bytes"
-            )
+        try:
+            # Validate data length
+            if len(data) % 2 != 0:  # 16-bit samples
+                raise BufferError("Invalid data length")
 
-        # Check for overflow
-        if self._buffer_size + len(data) > self.max_size:
-            raise BufferOverflowError(
-                f"Buffer overflow. Current: {self._buffer_size}, "
-                f"Adding: {len(data)}, Max: {self.max_size}"
-            )
+            # Determine target buffer
+            buffer_key = channel or "combined"
+            if buffer_key not in self._buffers or self._buffers[buffer_key] is None:
+                raise BufferError(f"Invalid buffer: {buffer_key}")
 
-        self._buffer.append(data)
-        self._buffer_size += len(data)
-        self._last_write_time = time.time()
+            buffer = self._buffers[buffer_key]
+            current_size = self._buffer_sizes[buffer_key]
 
-    def read(self, size: Optional[int] = None) -> bytes:
-        """
-        Read audio data from the buffer.
+            # Check for overflow
+            if current_size + len(data) > self.max_size:
+                self.stats["overflow_count"] += 1
+                # Remove oldest data to make room
+                while current_size + len(data) > self.max_size:
+                    removed = buffer.popleft()
+                    current_size -= len(removed)
+                    self._buffer_sizes[buffer_key] = current_size
+
+            # Add new data
+            buffer.append(data)
+            self._buffer_sizes[buffer_key] = current_size + len(data)
+            self._last_write[buffer_key] = datetime.now()
+            self.stats["total_bytes_written"] += len(data)
+
+            await self.event_bus.publish(Event(
+                type=EventType.AUDIO_CHUNK,
+                data={
+                    "status": "audio_buffered",
+                    "bytes_written": len(data)
+                }
+            ))
+        except BufferError:
+            raise
+        except Exception as e:
+            raise BufferError(f"Write failed: {e}")
+
+    async def read(
+            self,
+            size: Optional[int] = None,
+            channel: Optional[str] = None,
+            timeout: Optional[float] = None
+    ) -> Optional[bytes]:
+        """Read audio data from buffer.
 
         Args:
             size: Number of bytes to read (defaults to chunk_size)
+            channel: Optional channel identifier
+            timeout: Optional read timeout in seconds
 
         Returns:
-            Raw audio bytes
+            Audio data or None if no data available
 
         Raises:
-            BufferUnderrunError: If not enough data available
+            BufferError: If read fails
         """
-        read_size = size if size is not None else self.chunk_size
+        try:
+            read_size = size or self.chunk_size
+            buffer_key = channel or "combined"
 
-        # Check for underrun
-        if self._buffer_size < read_size:
-            raise BufferUnderrunError(
-                f"Buffer underrun. Available: {self._buffer_size}, "
-                f"Requested: {read_size}"
-            )
+            if buffer_key not in self._buffers or self._buffers[buffer_key] is None:
+                raise BufferError(f"Invalid buffer: {buffer_key}")
 
-        # Combine data from buffer
-        data = bytes()
-        remaining = read_size
+            buffer = self._buffers[buffer_key]
+            current_size = self._buffer_sizes[buffer_key]
 
-        while remaining > 0 and self._buffer:
-            chunk = self._buffer.popleft()
-            if len(chunk) <= remaining:
-                data += chunk
-                remaining -= len(chunk)
-                self._buffer_size -= len(chunk)
+            # Wait for data if timeout specified
+            if timeout and current_size < read_size:
+                start_time = datetime.now()
+                while (
+                        current_size < read_size and
+                        (datetime.now() - start_time).total_seconds() < timeout
+                ):
+                    await asyncio.sleep(0.001)
+                    current_size = self._buffer_sizes[buffer_key]
+
+            # Check if enough data available
+            if current_size < read_size:
+                self.stats["underrun_count"] += 1
+                return None
+
+            # Combine data from buffer
+            data = bytes()
+            remaining = read_size
+
+            while remaining > 0 and buffer:
+                chunk = buffer.popleft()
+                if len(chunk) <= remaining:
+                    data += chunk
+                    remaining -= len(chunk)
+                    self._buffer_sizes[buffer_key] -= len(chunk)
+                else:
+                    # Split chunk if needed
+                    data += chunk[:remaining]
+                    buffer.appendleft(chunk[remaining:])
+                    self._buffer_sizes[buffer_key] -= remaining
+                    remaining = 0
+
+            self._last_read[buffer_key] = datetime.now()
+            self.stats["total_bytes_read"] += len(data)
+            return data
+
+        except BufferError:
+            raise
+        except Exception as e:
+            raise BufferError(f"Read failed: {e}")
+
+    async def read_stream(
+            self,
+            channel: Optional[str] = None
+    ) -> AsyncIterator[bytes]:
+        """Stream audio data from buffer.
+
+        Args:
+            channel: Optional channel identifier
+
+        Yields:
+            Audio chunks
+        """
+        while True:
+            chunk = await self.read(channel=channel)
+            if chunk:
+                yield chunk
             else:
-                # Split chunk if needed
-                data += chunk[:remaining]
-                self._buffer.appendleft(chunk[remaining:])
-                self._buffer_size -= remaining
-                remaining = 0
+                await asyncio.sleep(0.001)
 
-        self._last_read_time = time.time()
-        return data
-
-    def get_available_bytes(self) -> int:
-        """Get number of bytes available in buffer."""
-        return self._buffer_size
-
-    def get_buffer_level(self) -> float:
-        """Get buffer level as percentage."""
-        return (self._buffer_size / self.max_size) * 100
-
-    def get_latency(self) -> float:
-        """Get current buffer latency in milliseconds."""
-        return (self._buffer_size / self.bytes_per_sample /
-                self.sample_rate * 1000)
-
-    def clear(self) -> None:
-        """Clear the buffer."""
-        self._buffer.clear()
-        self._buffer_size = 0
-
-    def is_empty(self) -> bool:
-        """Check if buffer is empty."""
-        return self._buffer_size == 0
-
-    def get_timing_info(self) -> Tuple[float, float, float]:
-        """
-        Get timing information about the buffer.
-
-        Returns:
-            Tuple of (write_age, read_age, total_latency) in seconds
-        """
-        now = time.time()
-        write_age = now - self._last_write_time
-        read_age = now - self._last_read_time
-        total_latency = self.get_latency() / 1000  # Convert ms to seconds
-
-        return write_age, read_age, total_latency
-
-
-class StreamBuffer:
-    """
-    Manages streaming buffer for real-time transcription with automatic
-    rate limiting and chunk optimization.
-    """
-
-    def __init__(self,
-                 target_latency: float = 100.0,  # ms
-                 max_latency: float = 500.0,     # ms
-                 chunk_duration: float = 100.0,   # ms
-                 sample_rate: int = 16000):
-        """
-        Initialize the streaming buffer.
+    def get_level(
+            self,
+            channel: Optional[str] = None
+    ) -> float:
+        """Get current buffer level as percentage.
 
         Args:
-            target_latency: Target buffer latency in milliseconds
-            max_latency: Maximum allowable latency in milliseconds
-            chunk_duration: Duration of each chunk in milliseconds
-            sample_rate: Audio sample rate
-        """
-        self.target_latency = target_latency
-        self.max_latency = max_latency
-        self.chunk_duration = chunk_duration
-        self.sample_rate = sample_rate
-
-        # Calculate sizes
-        bytes_per_chunk = int(
-            chunk_duration / 1000 * sample_rate * 4  # 4 bytes per sample
-        )
-        max_size = int(
-            max_latency / 1000 * sample_rate * 4
-        )
-
-        self.buffer = AudioBuffer(
-            max_size=max_size,
-            chunk_size=bytes_per_chunk,
-            sample_rate=sample_rate
-        )
-
-        # Rate limiting state
-        self._last_chunk_time = time.time()
-
-    async def write(self, data: bytes) -> None:
-        """
-        Write audio data to the streaming buffer.
-
-        Args:
-            data: Raw audio bytes
-        """
-        try:
-            self.buffer.write(data)
-        except BufferOverflowError:
-            # If buffer is full, drop oldest data
-            while (self.buffer.get_buffer_level() > 80 and
-                   self.buffer.get_available_bytes() + len(data) >
-                   self.buffer.max_size):
-                try:
-                    self.buffer.read()
-                except BufferUnderrunError:
-                    break
-            self.buffer.write(data)
-
-    async def read(self) -> Optional[bytes]:
-        """
-        Read a chunk from the streaming buffer with rate limiting.
+            channel: Optional channel identifier
 
         Returns:
-            Audio chunk or None if not enough time has elapsed
+            Buffer level percentage (0-100)
         """
-        # Check if enough time has elapsed since last chunk
-        elapsed = (time.time() - self._last_chunk_time) * 1000
-        if elapsed < self.chunk_duration:
-            return None
+        buffer_key = channel or "combined"
+        if buffer_key not in self._buffer_sizes:
+            return 0.0
+        return (self._buffer_sizes[buffer_key] / self.max_size) * 100
 
-        # Check if we have enough data
-        if self.buffer.get_available_bytes() < self.buffer.chunk_size:
-            return None
+    def get_latency(
+            self,
+            channel: Optional[str] = None
+    ) -> float:
+        """Get current buffer latency in milliseconds.
 
-        try:
-            chunk = self.buffer.read()
-            self._last_chunk_time = time.time()
-            return chunk
-        except BufferUnderrunError:
-            return None
+        Args:
+            channel: Optional channel identifier
 
-    def get_status(self) -> dict:
-        """Get current buffer status."""
-        write_age, read_age, latency = self.buffer.get_timing_info()
+        Returns:
+            Buffer latency in ms
+        """
+        buffer_key = channel or "combined"
+        samples = self._buffer_sizes[buffer_key] // 2  # 16-bit samples
+        return (samples / self.config.sample_rate_hz) * 1000
+
+    def clear(
+            self,
+            channel: Optional[str] = None
+    ) -> None:
+        """Clear buffer contents.
+
+        Args:
+            channel: Optional channel identifier to clear
+        """
+        if channel:
+            if channel in self._buffers and self._buffers[channel]:
+                self._buffers[channel].clear()
+                self._buffer_sizes[channel] = 0
+        else:
+            for key in self._buffers:
+                if self._buffers[key]:
+                    self._buffers[key].clear()
+                    self._buffer_sizes[key] = 0
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        """Get buffer status.
+
+        Returns:
+            Buffer status information
+        """
         return {
-            'buffer_level': self.buffer.get_buffer_level(),
-            'latency_ms': self.buffer.get_latency(),
-            'write_age_ms': write_age * 1000,
-            'read_age_ms': read_age * 1000,
-            'is_healthy': (
-                self.buffer.get_latency() <= self.max_latency and
-                not self.buffer.is_empty()
-            )
+            "levels": {
+                key: self.get_level(key)
+                for key in self._buffers.keys()
+                if self._buffers[key] is not None
+            },
+            "latencies": {
+                key: self.get_latency(key)
+                for key in self._buffers.keys()
+                if self._buffers[key] is not None
+            },
+            "stats": self.stats
         }

@@ -1,238 +1,280 @@
-from typing import Dict, Any, List, Optional
+"""AWS Transcribe service integration."""
+from typing import Dict, Any, Optional
 import asyncio
+import uuid
+
 from amazon_transcribe.client import TranscribeStreamingClient
 
+from .types import (
+    TranscriptionConfig,
+    TranscriptionState,
+)
+from .models import TranscriptionStore
+from .handlers import TranscriptionHandler
 from .exceptions import (
-    TranscriptionError,
-    ServiceUnavailableException,
-    RateLimitError,
+    StreamingError,
+    ConfigurationError,
     ConnectionError
 )
-
-
-class TranscriptionConfig:
-    """Configuration for AWS Transcribe streaming."""
-
-    def __init__(
-        self,
-        language_code: str = "en-US",
-        media_sample_rate_hz: int = 16000,
-        media_encoding: str = "pcm",
-        vocabulary_name: Optional[str] = None,
-        session_id: Optional[str] = None,
-        vocab_filter_name: Optional[str] = None,
-        vocab_filter_method: Optional[str] = None,
-        show_speaker_label: bool = False,
-        enable_channel_identification: bool = False,
-        number_of_channels: int = 1,
-        enable_partial_results_stabilization: bool = True,
-        partial_results_stability: str = "high",
-        content_identification_type: Optional[str] = None,
-        content_redaction_type: Optional[str] = None,
-        pii_entity_types: Optional[str] = None,
-        language_model_name: Optional[str] = None,
-        identify_language: bool = False,
-        language_options: Optional[List[str]] = None,
-        preferred_language: Optional[str] = None,
-        vocabulary_names: Optional[List[str]] = None,
-        vocabulary_filter_names: Optional[List[str]] = None
-    ):
-        """Initialize transcription configuration.
-
-        Args:
-            language_code: Language code for transcription
-            media_sample_rate_hz: Audio sample rate
-            media_encoding: Audio encoding format
-            vocabulary_name: Custom vocabulary name
-            session_id: Session identifier
-            vocab_filter_name: Vocabulary filter name
-            vocab_filter_method: Vocabulary filter method
-            show_speaker_label: Enable speaker labels
-            enable_channel_identification: Enable channel identification
-            number_of_channels: Number of audio channels
-            enable_partial_results_stabilization: Enable result stabilization
-            partial_results_stability: Stability level for partial results
-            content_identification_type: Content identification type
-            content_redaction_type: Content redaction type
-            pii_entity_types: PII entity types to redact
-            language_model_name: Custom language model name
-            identify_language: Enable language identification
-            language_options: List of possible languages
-            preferred_language: Preferred language for identification
-            vocabulary_names: List of custom vocabularies
-            vocabulary_filter_names: List of vocabulary filters
-        """
-        self.language_code = language_code
-        self.media_sample_rate_hz = media_sample_rate_hz
-        self.media_encoding = media_encoding
-        self.vocabulary_name = vocabulary_name
-        self.session_id = session_id
-        self.vocab_filter_name = vocab_filter_name
-        self.vocab_filter_method = vocab_filter_method
-        self.show_speaker_label = show_speaker_label
-        self.enable_channel_identification = enable_channel_identification
-        self.number_of_channels = number_of_channels
-        self.enable_partial_results_stabilization = (
-            enable_partial_results_stabilization
-        )
-        self.partial_results_stability = partial_results_stability
-        self.content_identification_type = content_identification_type
-        self.content_redaction_type = content_redaction_type
-        self.pii_entity_types = pii_entity_types
-        self.language_model_name = language_model_name
-        self.identify_language = identify_language
-        self.language_options = language_options
-        self.preferred_language = preferred_language
-        self.vocabulary_names = vocabulary_names
-        self.vocabulary_filter_names = vocabulary_filter_names
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert configuration to dictionary for AWS API."""
-        config = {
-            "language_code": self.language_code,
-            "media_sample_rate_hz": self.media_sample_rate_hz,
-            "media_encoding": self.media_encoding,
-            "vocabulary_name": self.vocabulary_name,
-            "session_id": self.session_id,
-            "vocab_filter_name": self.vocab_filter_name,
-            "vocab_filter_method": self.vocab_filter_method,
-            "show_speaker_label": self.show_speaker_label,
-            "enable_channel_identification":
-                self.enable_channel_identification,
-            "number_of_channels": self.number_of_channels,
-            "enable_partial_results_stabilization": (
-                self.enable_partial_results_stabilization
-            ),
-            "partial_results_stability": self.partial_results_stability,
-            "content_identification_type": self.content_identification_type,
-            "content_redaction_type": self.content_redaction_type,
-            "pii_entity_types": self.pii_entity_types,
-            "language_model_name": self.language_model_name,
-            "identify_language": self.identify_language,
-            "language_options": self.language_options,
-            "preferred_language": self.preferred_language,
-            "vocabulary_names": self.vocabulary_names,
-            "vocabulary_filter_names": self.vocabulary_filter_names
-        }
-        return {k: v for k, v in config.items() if v is not None}
+from src.events.bus import EventBus
+from src.events.types import Event, EventType
 
 
 class TranscribeManager:
-    """Manages AWS Transcribe streaming sessions with retry logic."""
+    """Manages AWS Transcribe streaming sessions."""
 
     def __init__(
-        self,
-        region: str,
-        config: Optional[TranscriptionConfig] = None,
-        max_retries: int = 3,
-        retry_delay: float = 1.0
+            self,
+            event_bus: EventBus,
+            region: str,
+            config: Optional[TranscriptionConfig] = None
     ):
-        """Initialize the transcription manager.
+        """Initialize transcribe manager.
 
         Args:
-            region: AWS region for transcription
-            config: Transcription configuration
-            max_retries: Maximum number of retry attempts
-            retry_delay: Delay between retries in seconds
+            region: AWS region
+            config: Optional transcription configuration
         """
+        self.event_bus = event_bus
         self.region = region
         self.config = config or TranscriptionConfig()
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.client = None
-        self.stream = None
-        self.handler = None
-
-    async def _create_client(self) -> None:
-        """Create AWS Transcribe client with retry logic."""
-        attempt = 0
-        while attempt < self.max_retries:
-            try:
-                self.client = TranscribeStreamingClient(region=self.region)
-                return
-            except Exception as e:
-                attempt += 1
-                if attempt == self.max_retries:
-                    raise ConnectionError(
-                        f"Failed to create client after {self.max_retries} "
-                        f"attempts: {e}"
-                    )
-                await asyncio.sleep(self.retry_delay * attempt)
-
-    async def start_stream(self) -> None:
-        """Start a new transcription stream."""
-        if not self.client:
-            await self._create_client()
-
-        try:
-            self.stream = await self.client.start_stream_transcription(
-                **self.config.to_dict()
-            )
-        except Exception as e:
-            raise TranscriptionError(f"Failed to start stream: {e}")
-
-    async def process_audio(
-        self,
-        audio_chunk: bytes,
-        retry_on_failure: bool = True
-    ) -> None:
-        """Process audio chunk with retry logic.
-
-        Args:
-            audio_chunk: Raw audio data to process
-            retry_on_failure: Whether to retry on failure
-        """
-        if not self.stream:
-            raise TranscriptionError("Stream not started")
-
-        attempt = 0
-        while attempt < (self.max_retries if retry_on_failure else 1):
-            try:
-                await self.stream.input_stream.send_audio_event(
-                    audio_chunk=audio_chunk
-                )
-                return
-            except Exception as e:
-                attempt += 1
-                if attempt == self.max_retries or not retry_on_failure:
-                    if "ThrottlingException" in str(e):
-                        raise RateLimitError(
-                            "Transcription rate limit exceeded"
-                        )
-                    elif "ServiceUnavailable" in str(e):
-                        raise ServiceUnavailableException(
-                            "AWS Transcribe service unavailable"
-                        )
-                    else:
-                        raise TranscriptionError(
-                            f"Failed to process audio: {e}"
-                            )
-                await asyncio.sleep(self.retry_delay * attempt)
-
-    async def stop_stream(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Stop transcription and return results."""
-        if self.stream:
-            try:
-                await self.stream.input_stream.end_stream()
-                results = await self._get_final_results()
-                self.stream = None
-                return results
-            except Exception as e:
-                raise TranscriptionError(f"Failed to stop stream: {e}")
-        return {'combined': [], 'channels': {'ch_0': [], 'ch_1': []}}
-
-    async def _get_final_results(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Get final transcription results."""
-        # Implementation depends on how you want to handle final results
-        # This is a placeholder that should be customized
-        return {'combined': [], 'channels': {'ch_0': [], 'ch_1': []}}
+        self.client: Optional[TranscribeStreamingClient] = None
+        self.store = TranscriptionStore(event_bus)
+        self.current_stream = None
+        self.current_handler = None
+        self.state = TranscriptionState.IDLE
+        self._error = None
 
     async def __aenter__(self):
-        """Async context manager entry."""
-        await self.start_stream()
-        return self
+        """Enter async context."""
+        try:
+            self.client = TranscribeStreamingClient(region=self.region)
+            return self
+        except Exception as e:
+            raise ConnectionError(f"Failed to create client: {e}")
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        if self.stream:
+        """Exit async context."""
+        if self.state != TranscriptionState.IDLE:
             await self.stop_stream()
+        self.client = None
+
+    async def start_stream(
+            self,
+            session_id: Optional[str] = None,
+            on_result: Optional[callable] = None,
+            on_error: Optional[callable] = None
+    ) -> str:
+        """Start transcription stream.
+
+        Args:
+            session_id: Optional session ID
+            on_result: Optional result callback
+            on_error: Optional error callback
+
+        Returns:
+            Session ID
+
+        Raises:
+            StreamingError: If stream fails to start
+            ConfigurationError: If configuration is invalid
+        """
+        try:
+            if not self.client:
+                raise ConfigurationError("Client not initialized")
+
+            if self.state != TranscriptionState.IDLE:
+                raise StreamingError("Stream already running")
+
+            self.state = TranscriptionState.STARTING
+            await self.event_bus.publish(Event(
+                type=EventType.TRANSCRIPT,
+                data={
+                    "status": "stream_started",
+                    "session_id": session_id
+                }
+            ))
+            session_id = session_id or str(uuid.uuid4())
+
+            # Create stream configuration
+            stream_config = {
+                "language_code": self.config.language_code,
+                "media_sample_rate_hz": self.config.sample_rate_hz,
+                "media_encoding": self.config.media_encoding,
+                "vocabulary_name": self.config.vocabulary_name,
+                "vocabulary_filter_name": self.config.vocabulary_filter_name,
+                "show_speaker_label": self.config.enable_speaker_separation,
+                "enable_channel_identification": (
+                    self.config.enable_channel_identification
+                ),
+                "number_of_channels": self.config.number_of_channels
+            }
+
+            # Start AWS stream
+            self.current_stream = await self.client.start_stream_transcription(
+                **stream_config
+            )
+
+            # Initialize store and handler
+            self.store.create_session(session_id, self.config.__dict__)
+            self.current_handler = TranscriptionHandler(
+                self.event_bus,
+                self.current_stream.output_stream,
+                self.store,
+                session_id,
+                on_result,
+                on_error
+            )
+
+            # Start handler
+            asyncio.create_task(self._run_handler())
+            self.state = TranscriptionState.STREAMING
+
+            return session_id
+
+        except Exception as e:
+            self.state = TranscriptionState.ERROR
+            self._error = str(e)
+            if isinstance(e, (StreamingError, ConfigurationError)):
+                raise
+            raise StreamingError(f"Failed to start stream: {e}")
+
+    async def process_audio(
+            self,
+            chunk: bytes,
+            # session_id: str,
+            # channel: Optional[str] = None
+    ) -> None:
+        """Process audio chunk.
+
+        Args:
+            chunk: Audio data
+            # session_id: Session ID
+            # channel: Optional channel identifier
+
+        Raises:
+            StreamingError: If processing fails
+        """
+        try:
+            if self.state != TranscriptionState.STREAMING:
+                raise StreamingError("Stream not active")
+
+            if not self.current_stream:
+                raise StreamingError("Stream not initialized")
+
+            await self.current_stream.input_stream.send_audio_event(
+                audio_chunk=chunk
+            )
+            await self.event_bus.publish(Event(
+                type=EventType.AUDIO_CHUNK,
+                data={
+                    "status": "audio_chunk_sent",
+                    "chunk_size": len(chunk)
+                }
+            ))
+
+        except Exception as e:
+            self.state = TranscriptionState.ERROR
+            self._error = str(e)
+            raise StreamingError(f"Failed to process audio: {e}")
+
+    async def stop_stream(
+            self,
+            session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Stop transcription stream.
+
+        Args:
+            session_id: Optional session ID to stop
+
+        Returns:
+            Final results if available
+
+        Raises:
+            StreamingError: If stop fails
+        """
+        try:
+            if self.state not in (
+                    TranscriptionState.STREAMING,
+                    TranscriptionState.ERROR
+            ):
+                return None
+
+            self.state = TranscriptionState.STOPPING
+
+            if self.current_stream:
+                await self.current_stream.input_stream.end_stream()
+
+            # Get final results if session specified
+            results = None
+            if session_id:
+                results = self.store.get_session_results(
+                    session_id,
+                    include_partial=False
+                )
+                self.store.cleanup_session(session_id)
+
+            self.current_stream = None
+            self.current_handler = None
+            self.state = TranscriptionState.IDLE
+            self._error = None
+
+            await self.event_bus.publish(Event(
+                type=EventType.TRANSCRIPT,
+                data={
+                    "status": "stream_stopped",
+                    "session_id": session_id
+                }
+            ))
+
+            return results
+
+        except Exception as e:
+            self.state = TranscriptionState.ERROR
+            self._error = str(e)
+            raise StreamingError(f"Failed to stop stream: {e}")
+
+    async def get_results(
+            self,
+            session_id: str,
+            include_partial: bool = False
+    ) -> Dict[str, Any]:
+        """Get results for session.
+
+        Args:
+            session_id: Session ID
+            include_partial: Whether to include partial results
+
+        Returns:
+            Session results
+        """
+        return self.store.get_session_results(
+            session_id,
+            include_partial
+        )
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        """Get current status.
+
+        Returns:
+            Status information
+        """
+        return {
+            "state": self.state.value,
+            "error": self._error,
+            "sessions": len(self.store.sessions)
+        }
+
+    async def _run_handler(self) -> None:
+        """Run transcription handler."""
+        try:
+            if not self.current_handler:
+                raise StreamingError("Handler not initialized")
+
+            await self.current_handler.handle_events()
+
+        except Exception as e:
+            self.state = TranscriptionState.ERROR
+            self._error = str(e)
+            # Handler will be cleaned up in stop_stream

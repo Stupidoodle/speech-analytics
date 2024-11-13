@@ -1,7 +1,9 @@
 import numpy as np
 from typing import Optional, Dict
 import librosa
-
+from src.events.types import EventType, Event
+from src.events.bus import EventBus
+import asyncio
 
 class AudioMixer:
     """
@@ -9,7 +11,8 @@ class AudioMixer:
     separation for transcription purposes.
     """
 
-    def __init__(self, sample_rate: int = 44100, chunk_size: int = 1024):
+    def __init__(self, event_bus: EventBus, sample_rate: int = 44100, chunk_size: int = 1024):
+        self.event_bus = event_bus
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.target_sample_rate = 16000  # AWS Transcribe preferred rate
@@ -102,6 +105,18 @@ class AudioMixer:
                  desktop_processed.astype(np.float32)
                  ) / 2
         mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
+
+        # Publish an event after preparation for transcription
+        asyncio.get_event_loop().run_until_complete(self.event_bus.publish(Event(
+            type=EventType.AUDIO_CHUNK,
+            data={
+                "status": "ready_for_transcription",
+                "channels": {
+                    'mic': mic_processed,
+                    'desktop': desktop_processed
+                }
+            }
+        )))
 
         return {
             'combined': mixed,

@@ -1,78 +1,79 @@
+from typing import Dict, Any, Optional
+
+
 class TranscriptionError(Exception):
     """Base exception for transcription errors."""
-    pass
 
-
-class ServiceException(TranscriptionError):
-    """Base exception for AWS service errors."""
-
-    def __init__(self, message=None, error_code=None, status_code=None):
+    def __init__(
+        self,
+        message: str,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
         super().__init__(message)
-        self.message = message or "Unknown service error"
-        self.error_code = error_code or "Unknown"
-        self.status_code = status_code or 500
-
-
-class BadRequestException(ServiceException):
-    """Exception raised when request is malformed."""
-    pass
-
-
-class ConflictException(ServiceException):
-    """Exception raised when there is a conflict with the current state."""
-    pass
-
-
-class InternalFailureException(ServiceException):
-    """Exception raised when service encounters internal error."""
-    pass
-
-
-class LimitExceededException(ServiceException):
-    """Exception raised when service limits are exceeded."""
-    pass
-
-
-class ServiceUnavailableException(ServiceException):
-    """Exception raised when service is unavailable."""
-    pass
-
-
-class ValidationException(ServiceException):
-    """Exception raised when validation fails."""
-    pass
-
-
-class CredentialsException(ServiceException):
-    """Exception raised when there are credential issues."""
-    pass
-
-
-class UnknownServiceException(ServiceException):
-    """Exception raised for unknown service errors."""
-    pass
-
-
-class TranscriptionConfigError(TranscriptionError):
-    """Exception raised for configuration errors."""
-    pass
+        self.message = message
+        self.details = details or {}
 
 
 class StreamingError(TranscriptionError):
-    """Exception raised for streaming-related errors."""
+    """Error in streaming transcription."""
     pass
 
 
-class RateLimitError(TranscriptionError):
-    """Exception raised when rate limits are hit."""
+class ServiceError(TranscriptionError):
+    """AWS Transcribe service error."""
+
+    def __init__(
+        self,
+        message: str,
+        error_code: Optional[str] = None,
+        status_code: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.error_code = error_code
+        self.status_code = status_code
+
+
+class BadRequestError(ServiceError):
+    """Invalid request error."""
     pass
 
 
-class QualityError(TranscriptionError):
-    """Exception raised for transcription quality issues."""
+class ConfigurationError(TranscriptionError):
+    """Error in transcription configuration."""
+    pass
+
+
+class AudioFormatError(TranscriptionError):
+    """Error in audio format."""
+    pass
+
+
+class BufferError(TranscriptionError):
+    """Error in audio buffer handling."""
+    pass
+
+
+class ResultError(TranscriptionError):
+    """Error in result handling."""
+    pass
+
+
+class VocabularyError(TranscriptionError):
+    """Error in vocabulary handling."""
     pass
 
 
 class ConnectionError(TranscriptionError):
-    """Exception raised for connection issues."""
+    """Connection error with AWS service."""
+    pass
+
+
+class ThrottlingError(ServiceError):
+    """AWS throttling error."""
+    pass
+
+
+class QuotaError(ServiceError):
+    """AWS quota exceeded error."""
     pass

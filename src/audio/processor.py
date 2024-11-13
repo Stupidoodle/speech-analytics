@@ -2,6 +2,9 @@
 import numpy as np
 from typing import Optional, Tuple
 from .exceptions import ProcessingError
+from src.events.types import EventType, Event
+from src.events.bus import EventBus
+import asyncio
 
 
 class AudioProcessor:
@@ -11,6 +14,7 @@ class AudioProcessor:
     """
 
     def __init__(self,
+                 event_bus: EventBus,
                  noise_threshold: float = 0.01,
                  gain: float = 1.0,
                  calibration_duration: float = 1.0,
@@ -24,6 +28,7 @@ class AudioProcessor:
             calibration_duration: Duration in seconds for noise profile
             sample_rate: Audio sample rate
         """
+        self.event_bus = event_bus
         self.noise_threshold = noise_threshold
         self.gain = gain
         self.calibration_duration = calibration_duration
@@ -218,6 +223,14 @@ class AudioProcessor:
 
             info['is_silence'] = self.detect_silence(processed)
 
+            # Publish an event for processed audio chunk
+            asyncio.get_event_loop().run_until_complete(self.event_bus.publish(Event(
+                type=EventType.AUDIO_CHUNK,
+                data={
+                    "status": "processed_chunk",
+                    "info": info
+                }
+            )))
             return processed, info
 
         except Exception as e:
