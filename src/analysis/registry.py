@@ -1,6 +1,7 @@
 """Analyzer registry and base analyzer implementation."""
 from typing import Dict, Any, List, Optional, Type
 from abc import ABC, abstractmethod
+import json
 
 from src.conversation.manager import ConversationManager
 from src.context.types import ContextEntry
@@ -58,12 +59,14 @@ class BaseAnalyzer(ABC):
     async def _get_ai_analysis(
             self,
             prompt: str,
+            expected_format: Dict[str, Any],
             max_tokens: int = 1000
     ) -> Dict[str, Any]:
         """Get analysis from AI model.
 
         Args:
             prompt: Analysis prompt
+            expected_format: Expected response format
             max_tokens: Maximum tokens for response
 
         Returns:
@@ -72,9 +75,18 @@ class BaseAnalyzer(ABC):
         Raises:
             AnalysisError: If AI analysis fails
         """
+        # Add format requirements to prompt
+        format_prompt = (
+            f"{prompt}\n\n"
+            "Provide response in the following JSON format:\n"
+            f"{json.dumps(expected_format, indent=2)}\n",
+            "Ensure all fields are present and properly typed."
+        )
         try:
             responses = []
-            async for response in self.conversation.send_message(prompt):
+            async for response in self.conversation.send_message(
+                format_prompt
+            ):
                 if response.text:
                     responses.append(response.text)
 
@@ -83,8 +95,8 @@ class BaseAnalyzer(ABC):
             # Parse analysis into structured format
             # This would depend on how we format our prompts and responses
             # For now, assuming JSON responses
+            # TODO: Use _validate_response to check response format and raise AnalysisFormatError if invalid
             try:
-                import json
                 return json.loads(analysis)
             except json.JSONDecodeError:
                 return {"text": analysis}
@@ -93,6 +105,27 @@ class BaseAnalyzer(ABC):
             raise AnalysisError(
                 f"AI analysis failed: {str(e)}"
             )
+
+    def _validate_response(
+            self,
+            response: Dict[str, Any],
+            expected_format: Dict[str, Any]
+    ) -> bool:
+        """Validate response matches expected format.
+
+        Args:
+            response: Response to validate
+            expected_format: Expected response format
+
+        Returns:
+            True if response matches expected format
+        """
+        for key, value in expected_format.items():
+            if key not in response:
+                return False
+            if not isinstance(response[key], value):
+                return False
+        return True
 
 
 class AnalyzerRegistry:

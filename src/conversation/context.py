@@ -1,486 +1,356 @@
-import aiofiles
-from typing import Dict, Any, List, Optional
+"""Conversation context management."""
+from typing import Dict, Any, List, Optional, Set
 from datetime import datetime
-from pathlib import Path
+
+from src.context.manager import ContextManager
+from src.events.bus import EventBus
+from src.events.types import Event, EventType
 
 from .types import (
     Role,
-    Document,
-    DocumentFormat,
+    MessageRole,
+    Message,
+    MessageContent,
+    MessageType,
+    SessionConfig,
+    ToolConfig
 )
-
-from .exceptions import (
-    DocumentError,
-)
+from .roles import RoleManager
+from .exceptions import ConversationError
 
 
 class ConversationContext:
-    """Manages conversation context, documents, and role-specific behavior."""
+    """Manages conversation context and state."""
 
-    def __init__(self, role: Role) -> None:
+    def __init__(
+        self,
+        event_bus: EventBus,
+        context_manager: ContextManager,
+        role_manager: RoleManager,
+        config: Optional[SessionConfig] = None
+    ):
         """Initialize conversation context.
 
         Args:
-            role: User's role in conversation
+            event_bus: Event bus instance
+            context_manager: Context manager instance
+            role_manager: Role manager instance
+            config: Optional session configuration
         """
-        self.role = role
-        self.documents: Dict[str, Document] = {}
-        self.system_prompts: List[Dict[str, Any]] = []
-        self.metadata: Dict[str, Any] = {}
+        self.event_bus = event_bus
+        self.context = context_manager
+        self.roles = role_manager
+        self.config = config or SessionConfig()
 
-        # Add role-specific system prompt
-        self._add_role_prompt()
+        # Conversation state
+        self.turns: List[Message] = []
+        self.tool_states: Dict[str, Dict[str, Any]] = {}
+        self.active_tools: Set[str] = set()
+        self.context_references: Dict[str, Set[str]] = {}
 
-    def _add_role_prompt(self) -> None:
-        """Add role-specific system prompt and behaviors."""
-
-        prompts = {
-            Role.INTERVIEWER: """You are conducting an interview. Focus on:
-            - Evaluating candidate responses against requirements
-            - Asking targeted follow-up questions
-            - Assessing technical and soft skills
-            - Maintaining structured interview flow
-            - Documenting key insights and red flags
-            - Referencing CV and job requirements
-            - Ensuring all key areas are covered
-            - Providing clear transitions between topics""",
-            Role.INTERVIEWEE: """You are a job candidate in an interview. Focus on:
-            - Providing clear, structured responses
-            - Using the STAR method for experience examples
-            - Demonstrating relevant skills and experience
-            - Showing enthusiasm and cultural fit
-            - Asking insightful questions about the role
-            - Connecting experience to job requirements
-            - Highlighting unique value proposition
-            - Maintaining professional communication
-            - Following up on interviewer's questions""",
-            Role.SUPPORT_AGENT: """You are providing customer support. Focus on:
-            - Understanding customer issues thoroughly
-            - Providing clear, step-by-step solutions
-            - Maintaining empathetic communication
-            - Following established procedures
-            - Documenting issue resolution
-            - Escalating when appropriate
-            - Referencing relevant documentation
-            - Ensuring customer satisfaction
-            - Following up on resolution""",
-            Role.CUSTOMER: """You are seeking customer support. Focus on:
-            - Clearly describing your issue or need
-            - Providing relevant context and details
-            - Following troubleshooting instructions
-            - Asking clarifying questions
-            - Confirming understanding
-            - Expressing concerns clearly
-            - Testing proposed solutions
-            - Providing feedback on resolution""",
-            Role.MEETING_HOST: """You are hosting a meeting. Focus on:
-            - Managing meeting flow and timing
-            - Ensuring participant engagement
-            - Keeping discussion on track
-            - Documenting key decisions
-            - Assigning action items
-            - Facilitating effective discussion
-            - Managing time for each agenda item
-            - Summarizing key points
-            - Ensuring clear next steps
-            - Following up on action items""",
-            Role.MEETING_PARTICIPANT: """You are participating in a meeting. Focus on:
-            - Contributing relevant insights
-            - Staying on topic
-            - Respecting time allocations
-            - Taking notes on key points
-            - Volunteering for action items
-            - Asking clarifying questions
-            - Supporting meeting objectives
-            - Following up on commitments
-            - Engaging constructively"""
-        }
-
-        # Add base role prompt
-        if self.role in prompts:
-            self.system_prompts.append({
-                "text": prompts[self.role],
-                "metadata": {"type": "role_prompt"}
-            })
-
-        # Add role-specific behaviors
-        behaviors = self._get_role_behaviors()
-        if behaviors:
-            self.system_prompts.append({
-                "text": behaviors,
-                "metadata": {"type": "role_behaviors"}
-            })
-
-    def _get_role_behaviors(self) -> Optional[str]:
-        """Get role-specific behaviors and guidelines."""
-        behaviors = {
-            Role.INTERVIEWER: """Behavioral Guidelines:
-            1. Time Management:
-               - Keep questions focused and relevant
-               - Allow adequate response time
-               - Maintain interview schedule
-        
-            2. Assessment:
-               - Use behavioral questioning techniques
-               - Look for specific examples
-               - Compare against job requirements
-               - Document candidate responses
-        
-            3. Communication:
-               - Use clear, professional language
-               - Provide smooth transitions
-               - Give clear instructions
-               - Maintain neutral tone
-        
-            4. Documentation:
-               - Note key qualifications
-               - Record red flags
-               - Track required skill coverage
-               - Document follow-up items""",
-            Role.INTERVIEWEE: """Behavioral Guidelines:
-            1. Response Structure:
-               - Use STAR method (Situation, Task, Action, Result)
-               - Provide specific examples
-               - Keep responses focused
-               - Highlight achievements
-        
-            2. Professional Conduct:
-               - Maintain positive attitude
-               - Show active listening
-               - Express genuine interest
-               - Demonstrate preparation
-        
-            3. Question Handling:
-               - Ask for clarification if needed
-               - Take time to formulate responses
-               - Provide relevant context
-               - Connect answers to role
-        
-            4. Follow-up:
-               - Note areas for elaboration
-               - Remember questions to ask
-               - Track discussion points
-               - Show initiative""",
-            Role.SUPPORT_AGENT: """Behavioral Guidelines:
-            1. Issue Resolution:
-               - Follow troubleshooting steps
-               - Document all actions taken
-               - Verify resolution
-               - Set clear expectations
-        
-            2. Communication:
-               - Use clear, simple language
-               - Show empathy and patience
-               - Provide progress updates
-               - Confirm understanding
-        
-            3. Documentation:
-               - Record all interactions
-               - Note solution steps
-               - Track issue status
-               - Document follow-up needs
-        
-            4. Escalation:
-               - Know escalation criteria
-               - Follow escalation procedures
-               - Keep customer informed
-               - Track escalated issues""",
-            Role.CUSTOMER: """Behavioral Guidelines:
-            1. Issue Reporting:
-               - Describe problem clearly
-               - Provide relevant details
-               - Follow instructions
-               - Report outcomes
-        
-            2. Communication:
-               - Stay focused on issue
-               - Ask for clarification
-               - Provide feedback
-               - Maintain patience
-        
-            3. Solution Testing:
-               - Follow steps exactly
-               - Report results clearly
-               - Note any issues
-               - Confirm resolution
-        
-            4. Follow-up:
-               - Document solution
-               - Track issue status
-               - Keep reference numbers
-               - Note contact points""",
-            Role.MEETING_HOST: """Behavioral Guidelines:
-            1. Meeting Management:
-               - Follow agenda strictly
-               - Manage time effectively
-               - Ensure participation
-               - Document decisions
-        
-            2. Facilitation:
-               - Encourage discussion
-               - Manage conflicts
-               - Keep focus on goals
-               - Drive to outcomes
-        
-            3. Documentation:
-               - Record key decisions
-               - Track action items
-               - Note agreements
-               - Capture next steps
-        
-            4. Follow-up:
-               - Distribute minutes
-               - Track action items
-               - Schedule follow-ups
-               - Monitor progress""",
-            Role.MEETING_PARTICIPANT: """Behavioral Guidelines:
-            1. Participation:
-               - Come prepared
-               - Stay engaged
-               - Contribute constructively
-               - Respect time limits
-        
-            2. Communication:
-               - Be clear and concise
-               - Listen actively
-               - Support discussion flow
-               - Ask relevant questions
-        
-            3. Documentation:
-               - Take personal notes
-               - Track commitments
-               - Record decisions
-               - Note action items
-        
-            4. Follow-up:
-               - Complete assigned tasks
-               - Report progress
-               - Share relevant updates
-               - Meet deadlines"""
-        }
-
-        return behaviors.get(self.role)
-
-    async def add_document(
-            self,
-            path: str,
-            doc_type: str,
-            metadata: Optional[Dict[str, Any]] = None
-    ) -> Document:
-        """Add document to context.
+    async def add_message(
+        self,
+        message: Message
+    ) -> None:
+        """Add message to conversation.
 
         Args:
-            path: Path to document
-            doc_type: Type of document (e.g., 'cv', 'spec')
-            metadata: Optional document metadata
+            message: Message to add
+        """
+        # Process message content
+        for content in message.content:
+            # Handle tool use
+            if content.type == MessageType.TOOL_USE:
+                await self._handle_tool_use(content)
+            # Handle tool results
+            elif content.type == MessageType.TOOL_RESULT:
+                await self._handle_tool_result(content)
+            # Handle context references
+            elif content.type == MessageType.CONTEXT:
+                await self._handle_context_reference(content)
+
+        # Add to turns
+        self.turns.append(message)
+
+        # Emit message event
+        await self.event_bus.publish(Event(
+            type=EventType.CONVERSATION,
+            data={
+                "action": "message_added",
+                "role": message.role,
+                "timestamp": message.timestamp
+            }
+        ))
+
+    async def get_context(
+        self,
+        include_tools: bool = True
+    ) -> Dict[str, Any]:
+        """Get current conversation context.
+
+        Args:
+            include_tools: Whether to include tool state
 
         Returns:
-            Processed document
+            Current context
+        """
+        context = {
+            "turns": len(self.turns),
+            "last_speaker": self.turns[-1].role if self.turns else None,
+            "timestamp": datetime.now(),
+            "references": dict(self.context_references)
+        }
+
+        if include_tools:
+            context["tools"] = {
+                "active": list(self.active_tools),
+                "states": self.tool_states
+            }
+
+        return context
+
+    async def _handle_tool_use(
+        self,
+        content: MessageContent
+    ) -> None:
+        """Handle tool use in message.
+
+        Args:
+            content: Tool use content
 
         Raises:
-            DocumentError: On document processing errors
+            ConversationError: If tool use is invalid
         """
-        try:
-            # Read document
-            doc_path = Path(path)
-            if not doc_path.exists():
-                raise DocumentError(f"Document not found: {path}")
+        if not content.tool_use:
+            return
 
-            # Determine format
-            format_map = {
-                ".pdf": DocumentFormat.PDF,
-                ".csv": DocumentFormat.CSV,
-                ".doc": DocumentFormat.DOC,
-                ".docx": DocumentFormat.DOCX,
-                ".txt": DocumentFormat.TXT,
-                ".md": DocumentFormat.MD
-            }
-            doc_format = format_map.get(doc_path.suffix.lower())
-            if not doc_format:
-                raise DocumentError(f"Unsupported format: {doc_path.suffix}")
+        tool_name = content.tool_use.get("name")
+        tool_id = content.tool_use.get("tool_use_id")
 
-            # Read content
-            content = await self._read_file(doc_path)
-
-            # Create document
-            document = Document(
-                content=content,
-                mime_type=doc_format.value,
-                name=doc_path.name,
-                metadata=metadata or {}
+        # Validate tool
+        tool_config = next(
+            (t for t in self.roles.get_tools(self.config.role)
+             if t.name == tool_name),
+            None
+        )
+        if not tool_config:
+            raise ConversationError(
+                f"Tool not allowed: {tool_name}"
             )
 
-            # Store document
-            doc_id = f"{doc_type}_{datetime.now().isoformat()}"
-            self.documents[doc_id] = document
-
-            # Add document prompt based on type
-            await self._add_document_prompt(document, doc_type)
-
-            return document
-
-        except Exception as e:
-            raise DocumentError(f"Failed to add document: {str(e)}")
-
-    async def _read_file(self, path: Path) -> bytes:
-        """Read file content.
-
-        Args:
-            path: File path
-
-        Returns:
-            File content as bytes
-        """
-        try:
-            async with aiofiles.open(path, mode="rb") as file:
-                content = await file.read()
-            return content
-        except Exception as e:
-            raise DocumentError(f"Failed to read file: {str(e)}")
-
-    async def _add_document_prompt(
-            self,
-            document: Document,
-            doc_type: str
-    ) -> None:
-        """Add document-specific system prompt based on role."""
-        prompts = {
-            # Interviewer Documents
-            ("cv", Role.INTERVIEWER): {
-                "text": """Review the candidate's CV focusing on:
-- Relevant experience and skills
-- Career progression
-- Technical expertise
-- Project achievements
-- Education and certifications
-Use this information to:
-- Ask targeted questions
-- Validate claimed experience
-- Assess skill levels
-- Identify areas for deeper exploration""",
-                "importance": "high"
-            },
-            ("job_description", Role.INTERVIEWER): {
-                "text": """Use this job description to:
-- Assess candidate fit against requirements
-- Focus questions on key skills needed
-- Evaluate technical competencies
-- Gauge culture fit
-- Verify experience levels""",
-                "importance": "high"
-            },
-
-            # Interviewee Documents
-            ("job_description", Role.INTERVIEWEE): {
-                "text": """Review the job description to:
-- Align responses with requirements
-- Highlight relevant experience
-- Demonstrate understanding of role
-- Show enthusiasm for responsibilities
-- Connect skills to needs""",
-                "importance": "high"
-            },
-            ("company_info", Role.INTERVIEWEE): {
-                "text": """Use company information to:
-- Show company research
-- Align with culture
-- Ask informed questions
-- Demonstrate interest""",
-                "importance": "medium"
-            },
-
-            # Support Agent Documents
-            ("manual", Role.SUPPORT_AGENT): {
-                "text": """Reference this manual for:
-- Standard procedures
-- Troubleshooting steps
-- Technical specifications
-- Solution guidelines
-- Escalation criteria""",
-                "importance": "high"
-            },
-            ("ticket_history", Role.SUPPORT_AGENT): {
-                "text": """Review ticket history to:
-- Understand issue context
-- Check previous solutions
-- Avoid duplicate efforts
-- Ensure consistent support""",
-                "importance": "medium"
-            },
-
-            # Customer Documents
-            ("product_manual", Role.CUSTOMER): {
-                "text": """Reference product documentation to:
-- Understand features
-- Follow instructions
-- Verify specifications
-- Check requirements""",
-                "importance": "medium"
-            },
-
-            # Meeting Host Documents
-            ("agenda", Role.MEETING_HOST): {
-                "text": """Use this agenda to:
-- Guide discussion flow
-- Manage time allocation
-- Track completion
-- Ensure coverage
-- Document decisions""",
-                "importance": "high"
-            },
-            ("previous_minutes", Role.MEETING_HOST): {
-                "text": """Review previous minutes to:
-- Follow up on actions
-- Maintain continuity
-- Track progress
-- Update status""",
-                "importance": "medium"
-            },
-
-            # Meeting Participant Documents
-            ("meeting_materials", Role.MEETING_PARTICIPANT): {
-                "text": """Review materials to:
-- Prepare contributions
-- Support discussion
-- Reference data
-- Track decisions""",
-                "importance": "high"
-            }
+        # Track tool state
+        self.active_tools.add(tool_name)
+        self.tool_states[tool_id] = {
+            "name": tool_name,
+            "status": "active",
+            "start_time": datetime.now(),
+            "input": content.tool_use.get("input", {})
         }
 
-        # Get prompt for document type and role
-        prompt_info = prompts.get((doc_type, self.role))
-        if prompt_info:
-            self.system_prompts.append({
-                "text": prompt_info["text"],
-                "document": {
-                    "format": document.mime_type,
-                    "name": document.name,
-                    "source": {"bytes": document.content}
-                },
-                "metadata": {
-                    "type": "document_prompt",
-                    "doc_type": doc_type,
-                    "importance": prompt_info["importance"]
-                }
-            })
+        # Emit tool event
+        await self.event_bus.publish(Event(
+            type=EventType.TOOL_USE,
+            data={
+                "tool": tool_name,
+                "tool_id": tool_id,
+                "status": "started"
+            }
+        ))
 
-    async def clear_context(
-            self,
-            context_type: Optional[str] = None
+    async def _handle_tool_result(
+        self,
+        content: MessageContent
     ) -> None:
-        """Clear specified context type.
+        """Handle tool result in message.
 
         Args:
-            context_type: Type of context to clear ('documents', 'prompts', or None for all)
+            content: Tool result content
         """
-        if context_type == "documents":
-            self.documents.clear()
-        elif context_type == "prompts":
-            self.system_prompts = []
-            self._add_role_prompt()  # Keep role prompt
-        elif context_type is None:
-            self.documents.clear()
-            self.system_prompts.clear()
-            self.metadata.clear()
-            self._add_role_prompt()  # Keep role prompt
+        if not content.tool_result:
+            return
+
+        tool_id = content.tool_result.get("tool_use_id")
+        if tool_id in self.tool_states:
+            # Update tool state
+            self.tool_states[tool_id].update({
+                "status": "completed",
+                "end_time": datetime.now(),
+                "result": content.tool_result.get("content", {})
+            })
+
+            # Remove from active tools
+            tool_name = self.tool_states[tool_id]["name"]
+            self.active_tools.discard(tool_name)
+
+            # Emit tool event
+            await self.event_bus.publish(Event(
+                type=EventType.TOOL_USE,
+                data={
+                    "tool": tool_name,
+                    "tool_id": tool_id,
+                    "status": "completed"
+                }
+            ))
+
+    async def _handle_context_reference(
+        self,
+        content: MessageContent
+    ) -> None:
+        """Handle context reference in message.
+
+        Args:
+            content: Context content
+        """
+        if not content.context_data:
+            return
+
+        # Track references
+        refs = content.context_data.get("references", [])
+        for ref in refs:
+            if ref not in self.context_references:
+                self.context_references[ref] = set()
+            self.context_references[ref].add(
+                content.context_data.get("source", "unknown")
+            )
+
+    def get_tool_state(
+        self,
+        tool_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get state of specific tool.
+
+        Args:
+            tool_id: Tool identifier
+
+        Returns:
+            Tool state if found
+        """
+        return self.tool_states.get(tool_id)
+
+    def get_active_tools(self) -> List[str]:
+        """Get currently active tools.
+
+        Returns:
+            List of active tool names
+        """
+        return list(self.active_tools)
+
+    async def get_tool_metrics(self) -> Dict[str, Any]:
+        """Get tool usage metrics.
+
+        Returns:
+            Tool metrics
+        """
+        metrics = {
+            "total_uses": len(self.tool_states),
+            "by_tool": {},
+            "average_duration": 0.0,
+            "success_rate": 0.0
+        }
+
+        if not self.tool_states:
+            return metrics
+
+        # Calculate tool-specific metrics
+        tool_counts = {}
+        total_duration = 0.0
+        successful = 0
+
+        for state in self.tool_states.values():
+            tool_name = state["name"]
+            tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+
+            if state["status"] == "completed":
+                successful += 1
+                if "start_time" in state and "end_time" in state:
+                    duration = (
+                        state["end_time"] -
+                        state["start_time"]
+                    ).total_seconds()
+                    total_duration += duration
+
+        metrics.update({
+            "by_tool": tool_counts,
+            "average_duration": (
+                total_duration / successful if successful else 0.0
+            ),
+            "success_rate": successful / len(self.tool_states)
+        })
+
+        return metrics
+
+    async def cleanup_tools(self) -> None:
+        """Clean up tool states."""
+        # Clear completed tools
+        completed_tools = [
+            tool_id
+            for tool_id, state in self.tool_states.items()
+            if state["status"] == "completed"
+        ]
+        for tool_id in completed_tools:
+            del self.tool_states[tool_id]
+
+        # Clear active tools
+        self.active_tools.clear()
+
+    def get_last_turn(
+        self,
+        role: Optional[MessageRole] = None
+    ) -> Optional[Message]:
+        """Get last conversation turn.
+
+        Args:
+            role: Optional role filter
+
+        Returns:
+            Last message if found
+        """
+        if not self.turns:
+            return None
+
+        if role:
+            for turn in reversed(self.turns):
+                if turn.role == role:
+                    return turn
+            return None
+
+        return self.turns[-1]
+
+    def get_turn_count(
+        self,
+        role: Optional[MessageRole] = None
+    ) -> int:
+        """Get number of conversation turns.
+
+        Args:
+            role: Optional role filter
+
+        Returns:
+            Turn count
+        """
+        if role:
+            return sum(1 for turn in self.turns if turn.role == role)
+        return len(self.turns)
+
+    async def get_summary(self) -> Dict[str, Any]:
+        """Get conversation summary.
+
+        Returns:
+            Conversation summary
+        """
+        return {
+            "turns": self.get_turn_count(),
+            "by_role": {
+                role: self.get_turn_count(role)
+                for role in MessageRole
+            },
+            "tools": await self.get_tool_metrics(),
+            "context_usage": {
+                ref: len(sources)
+                for ref, sources in self.context_references.items()
+            },
+            "duration": (
+                self.turns[-1].timestamp - self.turns[0].timestamp
+                if len(self.turns) > 1 else 0
+            ).total_seconds()
+        }

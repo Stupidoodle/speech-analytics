@@ -1,96 +1,87 @@
-from typing import Dict, Any, List, Optional, Literal
 from enum import Enum
-from pydantic import BaseModel
+from typing import Dict, Any, List, Optional, Literal
+from dataclasses import dataclass, field
 from datetime import datetime
-
-class ImageFormat(str, Enum):
-    """Supported image formats."""
-    PNG = "png"
-    JPEG = "jpeg"
-    GIF = "gif"
-    WEBP = "webp"
-
-
-class DocumentFormat(str, Enum):
-    """Supported document formats."""
-    PDF = "pdf"
-    CSV = "csv"
-    DOC = "doc"
-    DOCX = "docx"
-    XLS = "xls"
-    XLSX = "xlsx"
-    HTML = "html"
-    TXT = "txt"
-    MD = "md"
+from pydantic import BaseModel
 
 
 class MessageRole(str, Enum):
-    """Message roles for conversation."""
+    """Roles in conversation."""
+    SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
 
 
-class Message(BaseModel):
-    """A conversation Message"""
-    role: MessageRole
-    content: str
-    timestamp: datetime
-    metadata: Optional[Dict[str, Any]] = None
+class Role(str, Enum):
+    """User roles in system."""
+    INTERVIEWER = "interviewer"
+    INTERVIEWEE = "interviewee"
+    SUPPORT_AGENT = "support_agent"
+    CUSTOMER = "customer"
+    MEETING_HOST = "meeting_host"
+    MEETING_PARTICIPANT = "meeting_participant"
 
 
-class StopReason(str, Enum):
-    """Reasons for message stop."""
-    END_TURN = "end_turn"
+class MessageType(str, Enum):
+    """Types of messages."""
+    TEXT = "text"
     TOOL_USE = "tool_use"
-    MAX_TOKENS = "max_tokens"
-    STOP_SEQUENCE = "stop_sequence"
-    GUARDRAIL_INTERVENED = "guardrail_intervened"
-    CONTENT_FILTERED = "content_filtered"
+    TOOL_RESULT = "tool_result"
+    CONTEXT = "context"
+    SYSTEM = "system"
 
 
-class ImageContent(BaseModel):
-    """Image content in messages."""
-    format: ImageFormat
-    source: bytes
+class SessionState(str, Enum):
+    """States of conversation sessions."""
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    ERROR = "error"
 
 
-class DocumentContent(BaseModel):
-    """Document content in messages."""
-    format: DocumentFormat
-    name: str
-    source: bytes
+@dataclass
+class MessageContent:
+    """Content of a message."""
+    type: MessageType
+    text: Optional[str] = None
+    tool_use: Optional[Dict[str, Any]] = None
+    tool_result: Optional[Dict[str, Any]] = None
+    context_data: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-class ToolUse(BaseModel):
-    """Tool use in messages."""
-    tool_use_id: str
-    name: str
-    input: Any
+@dataclass
+class Message:
+    """A conversation message."""
+    role: MessageRole
+    content: List[MessageContent]
+    timestamp: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-class ToolResult(BaseModel):
-    """Tool result in messages."""
-    tool_use_id: str
-    content: List[Dict[str, Any]]
-    status: Literal["success", "error"]
-
-
-class InferenceConfig(BaseModel):
-    max_tokens: int
-    temperature: float
-    top_p: float
+class SessionConfig(BaseModel):
+    """Configuration for conversation session."""
+    role: Optional[Role] = None
+    max_turns: Optional[int] = None
+    auto_context: bool = True
+    tool_configs: Dict[str, Dict[str, Any]] = {}
+    custom_prompts: Dict[str, str] = {}
+    guardrails: Dict[str, Any] = {}
 
 
 class BedrockConfig(BaseModel):
-    """Bedrock configuration."""
+    """Configuration for Bedrock service."""
     model_id: str
-    inference_config: InferenceConfig
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    top_p: float = 0.9
+    stop_sequences: Optional[List[str]] = None
     tool_config: Optional[Dict[str, Any]] = None
     guardrail_config: Optional[Dict[str, Any]] = None
 
 
 class StreamResponse(BaseModel):
-    """Streaming response from Bedrock."""
+    """Response from streaming conversation."""
     class Delta(BaseModel):
         """Content delta in stream."""
         text: Optional[str] = None
@@ -104,28 +95,22 @@ class StreamResponse(BaseModel):
 
     content: Optional[Delta] = None
     metadata: Optional[Metadata] = None
-    stop_reason: Optional[StopReason] = None
+    stop_reason: Optional[str] = None
     error: Optional[Dict[str, Any]] = None
 
 
-class Role(Enum):
-    """
-    Enum for user roles in a conversation
-    """
-    INTERVIEWER = "interviewer"
-    INTERVIEWEE = "interviewee"
-    SUPPORT_AGENT = "support_agent"
-    CUSTOMER = "customer"
-    MEETING_HOST = "meeting_host"
-    MEETING_PARTICIPANT = "meeting_participant"
-
-
-class Document(BaseModel):
-    """
-    Document model
-    """
-    content: bytes
-    mime_type: DocumentFormat
-    # TODO: Add String sanitization
-    name: str
+class SystemPrompt(BaseModel):
+    """System prompt configuration."""
+    text: str
     metadata: Dict[str, Any] = {}
+    priority: int = 0
+    condition: Optional[str] = None
+
+
+class ToolConfig(BaseModel):
+    """Configuration for conversation tools."""
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    required: bool = False
+    timeout: float = 30.0

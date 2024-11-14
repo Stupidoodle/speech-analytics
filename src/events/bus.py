@@ -2,7 +2,7 @@
 from typing import Dict, Set, Callable, Coroutine, Any
 import asyncio
 import logging
-from types import Event, EventType
+from .types import Event, EventType
 
 logger = logging.getLogger(__name__)
 

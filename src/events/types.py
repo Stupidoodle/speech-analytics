@@ -16,6 +16,8 @@ class EventType(Enum):
     DOCUMENT_ADDED = "document_added"
     ERROR = "error"
     METRICS = "metrics"
+    ANALYSIS = "analysis"
+    CONVERSATION = "conversation"
 
 class Event(BaseModel):
     type: EventType

@@ -39,14 +39,28 @@ class SentimentAnalyzer(BaseAnalyzer):
 
         # Get AI-based sentiment analysis
         ai_prompt = (
-            "Analyze the sentiment in this text, providing:\n"
-            "1. Overall sentiment (positive/negative/neutral)\n"
-            "2. Confidence score (0-1)\n"
-            "3. Key sentiment indicators\n"
-            "4. Emotional undertones\n\n"
-            f"Text: {text}"
+            "Analyze the sentiment in this text. Consider:\n"
+            "1. Overall sentiment polarity (positive/negative/neutral)\n"
+            "2. Confidence in analysis (0-1)\n"
+            "3. Specific sentiment indicators (words/phrases)\n"
+            "4. Emotional undertones\n"
+            "5. Sentiment intensity\n"
+            "6. Key sentiment-bearing phrases\n\n"
+            f"Text: {text}\n\n"
         )
-        ai_analysis = await self._get_ai_analysis(ai_prompt)
+
+        expected_format = {
+            "sentiment": "string (positive/negative/neutral)",
+            "confidence": "float (0-1)",
+            "indicators": ["list of string"],
+            "emotions": ["list of string"],
+            "intensity": "float (0-1)",
+            "key_phrases": ["list of string"]
+        }
+
+        ai_analysis = await self._get_ai_analysis(
+            ai_prompt, expected_format
+        )
 
         # Create sentiment insight
         insights.append(AnalysisInsight(
@@ -137,13 +151,34 @@ class TopicAnalyzer(BaseAnalyzer):
         # Get AI-based topic analysis
         ai_prompt = (
             "Analyze the main topics in this text, providing:\n"
-            "1. Key topics and themes\n"
-            "2. Topic relationships\n"
-            "3. Topic importance scores\n"
-            "4. Context references\n\n"
+            "1. List of topics (name, relevance (0-1), mentions, related terms)\n"
+            "2. Relationships between topics (strength, type)\n"
+            "3. Importance of each topic\n\n"
             f"Text: {text}"
         )
-        ai_analysis = await self._get_ai_analysis(ai_prompt)
+
+        expected_format = {
+            "topics": [{
+                "name": "string",
+                "relevance": "float (0-1)",
+                "mentions": "integer",
+                "related_terms": ["list of string"]
+            }],
+            "relationships": [{
+                "topic1": "string",
+                "topic2": "string",
+                "strength": "float (0-1)",
+                "type": "string"
+            }],
+            "importance": {
+                "topic_name": "float (0-1)"
+            }
+        }
+
+        ai_analysis = await self._get_ai_analysis(
+            ai_prompt,
+            expected_format
+        )
 
         # Create topic insight
         insights.append(AnalysisInsight(
@@ -243,12 +278,33 @@ class QualityAnalyzer(BaseAnalyzer):
         ai_prompt = (
             "Analyze the conversation quality, providing:\n"
             "1. Clarity score (0-1)\n"
-            "2. Engagement level\n"
-            "3. Communication effectiveness\n"
-            "4. Areas for improvement\n\n"
+            "2. Engagement level (0-1)\n"
+            "3. Communication effectiveness (0-1)\n"
+            "4. Suggestions for improvement (aspects, suggestions, priorities(high/medium/low)\n"
+            "5. Metrics for coherence, relevance, and completeness\n\n"
             f"Text: {text}"
         )
-        ai_analysis = await self._get_ai_analysis(ai_prompt)
+
+        expected_format = {
+            "clarity": "float (0-1)",
+            "engagement": "float (0-1)",
+            "effectiveness": "float (0-1)",
+            "improvements": [{
+                "aspect": "string",
+                "suggestion": "string",
+                "priority": "string (high/medium/low)"
+            }],
+            "metrics": {
+                "coherence": "float (0-1)",
+                "relevance": "float (0-1)",
+                "completeness": "float (0-1)"
+            }
+        }
+
+        ai_analysis = await self._get_ai_analysis(
+            ai_prompt,
+            expected_format
+        )
 
         # Create quality insight
         insights.append(AnalysisInsight(
