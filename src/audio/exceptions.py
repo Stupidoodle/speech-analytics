@@ -1,63 +1,129 @@
+"""Audio processing exceptions."""
+from typing import Dict, Any, Optional
+
+
 class AudioError(Exception):
-    """Base exception for all audio-related errors."""
-    pass
+    """Base exception for audio processing errors."""
+
+    def __init__(
+        self,
+        message: str,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.details = details or {}
 
 
 class DeviceError(AudioError):
-    """Raised when there are issues with audio devices."""
-    pass
+    """Error in audio device operations."""
 
 
 class DeviceNotFoundError(DeviceError):
-    """Raised when a specified audio device cannot be found."""
-    pass
+    """Specified audio device not found."""
+
+    def __init__(
+        self,
+        device_id: int,
+        message: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(
+            message or f"Device not found: {device_id}",
+            details
+        )
+        self.device_id = device_id
 
 
 class DeviceConfigError(DeviceError):
-    """Raised when there's an error configuring an audio device."""
-    pass
+    """Error in device configuration."""
+
+    def __init__(
+        self,
+        message: str,
+        config: Dict[str, Any],
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.config = config
 
 
 class DeviceInUseError(DeviceError):
-    """Raised when attempting to use an audio device that's already in use."""
-    pass
+    """Device already in use."""
+
+    def __init__(
+        self,
+        device_id: int,
+        message: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(
+            message or f"Device in use: {device_id}",
+            details
+        )
+        self.device_id = device_id
 
 
 class ProcessingError(AudioError):
-    """Raised when audio processing operations fail."""
-    pass
+    """Error in audio processing."""
 
-
-class CaptureError(AudioError):
-    """Raised when audio capture operations fail."""
-    pass
-
-
-class StreamError(AudioError):
-    """Raised when audio streaming operations fail."""
-    pass
+    def __init__(
+        self,
+        message: str,
+        processing_step: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.processing_step = processing_step
 
 
 class MixerError(AudioError):
-    """Raised when audio mixing operations fail."""
-    pass
+    """Error in audio mixing."""
 
-
-class InvalidAudioDataError(AudioError):
-    """Raised when audio data is invalid or corrupted."""
-    pass
+    def __init__(
+        self,
+        message: str,
+        channels: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.channels = channels
 
 
 class BufferError(AudioError):
-    """Raised when there are issues with audio buffers."""
-    pass
+    """Error in audio buffer operations."""
+
+    def __init__(
+        self,
+        message: str,
+        buffer_stats: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.buffer_stats = buffer_stats
 
 
 class FormatError(AudioError):
-    """Raised when there are audio format incompatibilities."""
-    pass
+    """Error in audio format handling."""
+
+    def __init__(
+        self,
+        message: str,
+        format_type: str,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.format_type = format_type
 
 
 class CalibrationError(AudioError):
-    """Raised when audio calibration fails."""
-    pass
+    """Error in audio calibration."""
+
+    def __init__(
+        self,
+        message: str,
+        calibration_type: str,
+        details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.calibration_type = calibration_type

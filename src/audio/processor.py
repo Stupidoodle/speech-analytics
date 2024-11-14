@@ -1,237 +1,225 @@
-# src/audio/processor.py
+"""Audio signal processing and enhancement."""
+from typing import Dict, Optional, Tuple
+import time
+
 import numpy as np
-from typing import Optional, Tuple
-from .exceptions import ProcessingError
-from src.events.types import EventType, Event
+from scipy import signal
+
 from src.events.bus import EventBus
-import asyncio
+from src.events.types import Event, EventType
+from .exceptions import ProcessingError
+from .types import AudioConfig, ProcessingResult, AudioMetrics
 
 
 class AudioProcessor:
-    """
-    Handles audio processing tasks like noise reduction, normalization,
-    and gain control.
-    """
+    """Handles audio processing and enhancement."""
 
-    def __init__(self,
-                 event_bus: EventBus,
-                 noise_threshold: float = 0.01,
-                 gain: float = 1.0,
-                 calibration_duration: float = 1.0,
-                 sample_rate: int = 16000):
-        """
-        Initialize the audio processor.
+    def __init__(
+        self,
+        event_bus: EventBus,
+        config: AudioConfig,
+        noise_threshold: float = 0.01,
+        gain_target: float = 0.7,
+    ) -> None:
+        """Initialize audio processor.
 
         Args:
-            noise_threshold: Threshold for noise gate (0.0 to 1.0)
-            gain: Audio gain multiplier
-            calibration_duration: Duration in seconds for noise profile
-            sample_rate: Audio sample rate
+            event_bus: Event bus instance
+            config: Audio configuration
+            noise_threshold: Noise gate threshold
+            gain_target: Target gain level
         """
         self.event_bus = event_bus
+        self.config = config
         self.noise_threshold = noise_threshold
-        self.gain = gain
-        self.calibration_duration = calibration_duration
-        self.sample_rate = sample_rate
+        self.gain_target = gain_target
 
-        # State variables
+        # Processing state
         self.noise_profile: Optional[np.ndarray] = None
-        self.is_calibrated = False
         self._running_max = 0.0
-        self._silence_counter = 0
+        self._calibrated = False
 
-    def calibrate_noise(self, audio: np.ndarray) -> None:
-        """
-        Calibrate noise profile from audio sample.
-
-        Args:
-            audio: numpy array of audio data
-        """
-        try:
-            # Convert to float32 for processing
-            audio_float = audio.astype(np.float32) / 32768.0
-
-            # Calculate noise profile using mean and std
-            self.noise_profile = np.mean(np.abs(audio_float))
-            self.is_calibrated = True
-
-        except Exception as e:
-            raise ProcessingError(f"Failed to calibrate noise profile: {e}")
-
-    def reduce_noise(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Apply noise reduction using spectral gating.
+    async def process_chunk(
+        self,
+        audio_data: bytes,
+        apply_noise_reduction: bool = True,
+        apply_gain: bool = True,
+    ) -> ProcessingResult:
+        """Process audio chunk.
 
         Args:
-            audio: numpy array of audio data
-
-        Returns:
-            Noise-reduced audio data
-        """
-        try:
-            # Convert to float32 for processing
-            audio_float = audio.astype(np.float32) / 32768.0
-
-            if self.is_calibrated and self.noise_profile is not None:
-                # Apply noise gate
-                mask = np.abs(audio_float) > (self.noise_profile *
-                                              self.noise_threshold)
-                audio_float *= mask
-
-            # Convert back to int16
-            return (audio_float * 32767).astype(np.int16)
-
-        except Exception as e:
-            raise ProcessingError(f"Failed to reduce noise: {e}")
-
-    def normalize(self,
-                  audio: np.ndarray,
-                  target_peak: float = 0.95
-                  ) -> Tuple[np.ndarray, float]:
-        """
-        Normalize audio to target peak amplitude.
-
-        Args:
-            audio: numpy array of audio data
-            target_peak: Target peak amplitude (0.0 to 1.0)
-
-        Returns:
-            Tuple of (normalized audio, peak amplitude)
-        """
-        try:
-            # Convert to float32 for processing
-            audio_float = audio.astype(np.float32) / 32768.0
-
-            # Calculate current peak
-            current_peak = np.max(np.abs(audio_float))
-
-            # Update running maximum with decay
-            self._running_max = max(current_peak,
-                                    self._running_max * 0.95)
-
-            if self._running_max > 0:
-                # Calculate normalization factor
-                norm_factor = target_peak / self._running_max
-                # Apply normalization
-                audio_float *= norm_factor
-
-            # Clip to prevent overflow
-            audio_float = np.clip(audio_float, -1.0, 1.0)
-
-            # Convert back to int16
-            return ((audio_float * 32767).astype(np.int16),
-                    self._running_max)
-
-        except Exception as e:
-            raise ProcessingError(f"Failed to normalize audio: {e}")
-
-    def apply_gain(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Apply gain to audio data.
-
-        Args:
-            audio: numpy array of audio data
-
-        Returns:
-            Gain-adjusted audio data
-        """
-        try:
-            # Convert to float32 for processing
-            audio_float = audio.astype(np.float32) / 32768.0
-
-            # Apply gain
-            audio_float *= self.gain
-
-            # Clip to prevent overflow
-            audio_float = np.clip(audio_float, -1.0, 1.0)
-
-            # Convert back to int16
-            return (audio_float * 32767).astype(np.int16)
-
-        except Exception as e:
-            raise ProcessingError(f"Failed to apply gain: {e}")
-
-    def detect_silence(self,
-                       audio: np.ndarray,
-                       threshold: float = 0.01,
-                       min_duration: float = 0.5
-                       ) -> bool:
-        """
-        Detect if audio chunk is silence.
-
-        Args:
-            audio: numpy array of audio data
-            threshold: Amplitude threshold for silence detection
-            min_duration: Minimum duration of silence (seconds)
-
-        Returns:
-            True if audio is considered silence
-        """
-        try:
-            # Convert to float32 for processing
-            audio_float = audio.astype(np.float32) / 32768.0
-
-            # Calculate RMS amplitude
-            rms = np.sqrt(np.mean(np.square(audio_float)))
-
-            # Update silence counter
-            if rms < threshold:
-                self._silence_counter += len(audio) / self.sample_rate
-            else:
-                self._silence_counter = 0
-
-            return self._silence_counter >= min_duration
-
-        except Exception as e:
-            raise ProcessingError(f"Failed to detect silence: {e}")
-
-    def process_chunk(self,
-                      audio: np.ndarray,
-                      apply_noise_reduction: bool = True,
-                      apply_normalization: bool = True,
-                      apply_gain_control: bool = True
-                      ) -> Tuple[np.ndarray, dict]:
-        """
-        Process an audio chunk with selected processors.
-
-        Args:
-            audio: numpy array of audio data
+            audio_data: Raw audio data
             apply_noise_reduction: Whether to apply noise reduction
-            apply_normalization: Whether to apply normalization
-            apply_gain_control: Whether to apply gain control
+            apply_gain: Whether to apply automatic gain
 
         Returns:
-            Tuple of (processed audio, processing info)
+            Processing result
+
+        Raises:
+            ProcessingError: If processing fails
         """
         try:
-            processed = audio.copy()
-            info = {
-                'peak_amplitude': 0.0,
-                'is_silence': False,
-                'applied_gain': self.gain
+            start_time = time.time()
+
+            # Convert to float array
+            float_data = self._to_float_array(audio_data)
+
+            # Apply processing steps
+            processed = float_data
+            if apply_noise_reduction and self._calibrated:
+                processed = await self._reduce_noise(processed)
+            if apply_gain:
+                processed = await self._apply_gain(processed)
+
+            # Calculate metrics
+            metrics = self._calculate_metrics(
+                processed,
+                time.time() - start_time
+            )
+
+            # Convert back to bytes
+            processed_bytes = (processed * 32767).astype(np.int16).tobytes()
+
+            result = ProcessingResult(
+                processed_data=processed_bytes,
+                metrics=metrics,
+                format=self.config.format,
+                sample_rate=self.config.sample_rate,
+                channels=self.config.channels,
+                duration=len(processed) / self.config.sample_rate
+            )
+
+            await self._publish_processor_event("processing_complete", result)
+            return result
+
+        except Exception as e:
+            raise ProcessingError(f"Processing failed: {e}")
+
+    async def calibrate_noise(self, audio_data: bytes) -> None:
+        """Calibrate noise profile from audio sample.
+
+        Args:
+            audio_data: Audio sample for calibration
+
+        Raises:
+            ProcessingError: If calibration fails
+        """
+        try:
+            # Convert to float array
+            float_data = self._to_float_array(audio_data)
+
+            # Calculate noise profile
+            self.noise_profile = np.mean(np.abs(float_data))
+            self._calibrated = True
+
+            await self._publish_processor_event(
+                "calibration_complete",
+                {
+                    "noise_profile": float(self.noise_profile),
+                    "threshold": self.noise_threshold
+                }
+            )
+
+        except Exception as e:
+            raise ProcessingError(f"Calibration failed: {e}")
+
+    async def _reduce_noise(
+        self,
+        audio_data: np.ndarray
+    ) -> np.ndarray:
+        """Apply noise reduction.
+
+        Args:
+            audio_data: Audio data array
+
+        Returns:
+            Noise reduced audio
+        """
+        if self.noise_profile is None:
+            return audio_data
+
+        # Apply spectral gating
+        mask = np.abs(audio_data) > (self.noise_profile * self.noise_threshold)
+        return audio_data * mask
+
+    async def _apply_gain(self, audio_data: np.ndarray) -> np.ndarray:
+        """Apply automatic gain control.
+
+        Args:
+            audio_data: Audio data array
+
+        Returns:
+            Gain adjusted audio
+        """
+        # Update running maximum
+        current_max = np.max(np.abs(audio_data))
+        self._running_max = max(current_max, self._running_max * 0.95)
+
+        if self._running_max > 0:
+            # Calculate gain adjustment
+            gain = self.gain_target / self._running_max
+            audio_data *= gain
+
+        return np.clip(audio_data, -1.0, 1.0)
+
+    def _to_float_array(self, audio_bytes: bytes) -> np.ndarray:
+        """Convert audio bytes to float array.
+
+        Args:
+            audio_bytes: Raw audio data
+
+        Returns:
+            Normalized float array
+        """
+        return np.frombuffer(
+            audio_bytes, dtype=np.int16
+        ).astype(np.float32) / 32768.0
+
+    def _calculate_metrics(
+        self,
+        audio_data: np.ndarray,
+        processing_time: float
+    ) -> AudioMetrics:
+        """Calculate audio metrics.
+
+        Args:
+            audio_data: Audio data array
+            processing_time: Processing duration
+
+        Returns:
+            Audio metrics
+        """
+        return AudioMetrics(
+            peak_level=float(np.max(np.abs(audio_data))),
+            rms_level=float(np.sqrt(np.mean(audio_data**2))),
+            noise_level=float(
+                self.noise_profile if self._calibrated else 0.0
+            ),
+            clipping_count=int(np.sum(np.abs(audio_data) > 0.99)),
+            dropout_count=int(np.sum(np.abs(audio_data) < 0.01)),
+            processing_time=processing_time,
+            buffer_stats={
+                "running_max": float(self._running_max)
             }
+        )
 
-            if apply_noise_reduction and self.is_calibrated:
-                processed = self.reduce_noise(processed)
+    async def _publish_processor_event(
+        self,
+        status: str,
+        data: Dict
+    ) -> None:
+        """Publish processor event.
 
-            if apply_normalization:
-                processed, peak = self.normalize(processed)
-                info['peak_amplitude'] = peak
-
-            if apply_gain_control:
-                processed = self.apply_gain(processed)
-
-            info['is_silence'] = self.detect_silence(processed)
-
-            # Publish an event for processed audio chunk
-            asyncio.get_event_loop().run_until_complete(self.event_bus.publish(Event(
+        Args:
+            status: Event status
+            data: Event data
+        """
+        await self.event_bus.publish(
+            Event(
                 type=EventType.AUDIO_CHUNK,
                 data={
-                    "status": "processed_chunk",
-                    "info": info
+                    "status": status,
+                    "processor_data": data
                 }
-            )))
-            return processed, info
-
-        except Exception as e:
-            raise ProcessingError(f"Failed to process audio chunk: {e}")
+            )
+        )

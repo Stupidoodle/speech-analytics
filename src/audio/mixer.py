@@ -1,156 +1,207 @@
+"""Audio stream mixing and channel management."""
+from typing import Dict, Optional, Tuple
+
 import numpy as np
-from typing import Optional, Dict
 import librosa
-from src.events.types import EventType, Event
+
 from src.events.bus import EventBus
-import asyncio
+from src.events.types import Event, EventType
+from .exceptions import MixerError
+from .types import AudioConfig, ProcessingResult, AudioMetrics
+
 
 class AudioMixer:
-    """
-    Handles mixing and processing of audio streams while maintaining channel
-    separation for transcription purposes.
-    """
+    """Handles mixing and processing of audio streams."""
 
-    def __init__(self, event_bus: EventBus, sample_rate: int = 44100, chunk_size: int = 1024):
-        self.event_bus = event_bus
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.target_sample_rate = 16000  # AWS Transcribe preferred rate
-
-    def _resample(self,
-                  audio_data: np.ndarray,
-                  original_rate: int
-                  ) -> np.ndarray:
-        """Resample audio to target sample rate for transcription"""
-        if original_rate == self.target_sample_rate:
-            return audio_data
-
-        if len(audio_data.shape) > 1:
-            audio_data = audio_data.mean(axis=1)
-
-        resampled_data = librosa.resample(audio_data,
-                                          orig_sr=original_rate,
-                                          target_sr=self.target_sample_rate
-                                          )
-
-        resampled_data = np.clip(resampled_data,
-                                 -32768,
-                                 32767
-                                 )
-        resampled_data = resampled_data.astype(np.int16)
-
-        return resampled_data
-
-    def prepare_for_transcription(
+    def __init__(
         self,
-        mic_data: Optional[np.ndarray],
-        desktop_data: Optional[np.ndarray],
-        mic_rate: int,
-        desktop_rate: int
-    ) -> Dict[str, np.ndarray]:
+        event_bus: EventBus,
+        config: AudioConfig,
+    ) -> None:
+        """Initialize audio mixer.
+
+        Args:
+            event_bus: Event bus instance
+            config: Audio configuration
         """
-        Prepares audio data for transcription by:
-        1. Resampling to 16kHz if needed
-        2. Converting to correct format (16-bit PCM)
-        3. Organizing channels properly
+        self.event_bus = event_bus
+        self.config = config
+        self.target_rate = 16000  # Target sample rate for transcription
 
-        Returns a dict with:
-        - 'combined': Mixed audio for recording/monitoring
-        - 'ch_0': Microphone audio (resampled)
-        - 'ch_1': Desktop audio (resampled)
+    async def mix_streams(
+        self,
+        primary: bytes,
+        secondary: Optional[bytes] = None,
+        primary_gain: float = 1.0,
+        secondary_gain: float = 0.7
+    ) -> ProcessingResult:
+        """Mix two audio streams with gain control.
+
+        Args:
+            primary: Primary audio stream
+            secondary: Optional secondary stream
+            primary_gain: Gain for primary stream
+            secondary_gain: Gain for secondary stream
+
+        Returns:
+            Mixed audio result
+
+        Raises:
+            MixerError: If mixing fails
         """
-        # Handle none cases
-        if mic_data is None and desktop_data is None:
-            return {
-                'combined': np.zeros(0, dtype=np.int16),
-                'ch_0': np.zeros(0, dtype=np.int16),
-                'ch_1': np.zeros(0, dtype=np.int16)
-            }
+        try:
+            # Convert to float arrays
+            primary_arr = self._to_float_array(primary)
+            if secondary is not None:
+                secondary_arr = self._to_float_array(secondary)
+                # Ensure same length
+                length = min(len(primary_arr), len(secondary_arr))
+                primary_arr = primary_arr[:length]
+                secondary_arr = secondary_arr[:length]
+            else:
+                secondary_arr = None
 
-        # Process microphone audio
-        if mic_data is not None:
-            mic_processed = self._resample(mic_data, mic_rate)
-            # Ensure it's mono
-            if len(mic_processed.shape) > 1:
-                mic_processed = mic_processed.mean(axis=1)
-        else:
-            mic_processed = np.zeros(self.chunk_size, dtype=np.int16)
+            # Apply gain and mix
+            primary_arr *= primary_gain
+            if secondary_arr is not None:
+                secondary_arr *= secondary_gain
+                mixed = primary_arr + secondary_arr
+            else:
+                mixed = primary_arr
 
-        # Process desktop audio
-        if desktop_data is not None:
-            desktop_processed = self._resample(desktop_data, desktop_rate)
-            # Ensure it's mono
-            if len(desktop_processed.shape) > 1:
-                desktop_processed = desktop_processed.mean(axis=1)
-        else:
-            desktop_processed = np.zeros(self.chunk_size, dtype=np.int16)
+            # Clip to prevent overflow
+            mixed = np.clip(mixed, -1.0, 1.0)
 
-        # Make sure both channels have the same length
-        target_length = max(len(mic_processed), len(desktop_processed))
-        if len(mic_processed) < target_length:
-            mic_processed = np.pad(mic_processed,
-                                   (0,
-                                    target_length - len(mic_processed)
-                                    )
-                                   )
-        if len(desktop_processed) < target_length:
-            desktop_processed = np.pad(desktop_processed,
-                                       (0,
-                                        target_length - len(desktop_processed)
-                                        )
-                                       )
+            # Convert back to bytes
+            mixed_bytes = (mixed * 32767).astype(np.int16).tobytes()
 
-        # Create mixed version for recording/monitoring
-        mixed = (mic_processed.astype(np.float32) +
-                 desktop_processed.astype(np.float32)
-                 ) / 2
-        mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
+            metrics = self._calculate_metrics(mixed)
 
-        # Publish an event after preparation for transcription
-        asyncio.get_event_loop().run_until_complete(self.event_bus.publish(Event(
-            type=EventType.AUDIO_CHUNK,
-            data={
-                "status": "ready_for_transcription",
-                "channels": {
-                    'mic': mic_processed,
-                    'desktop': desktop_processed
+            # Create result
+            result = ProcessingResult(
+                processed_data=mixed_bytes,
+                metrics=metrics,
+                format=self.config.format,
+                sample_rate=self.config.sample_rate,
+                channels=self.config.channels,
+                duration=len(mixed) / self.config.sample_rate
+            )
+
+            await self._publish_mixer_event("mix_complete", result)
+            return result
+
+        except Exception as e:
+            raise MixerError(f"Failed to mix streams: {e}")
+
+    async def prepare_for_transcription(
+        self,
+        audio_data: bytes,
+    ) -> Tuple[bytes, AudioMetrics]:
+        """Prepare audio for transcription.
+
+        Args:
+            audio_data: Raw audio data
+
+        Returns:
+            Processed audio and metrics
+
+        Raises:
+            MixerError: If processing fails
+        """
+        try:
+            # Convert to float array
+            float_data = self._to_float_array(audio_data)
+
+            # Resample if needed
+            if self.config.sample_rate != self.target_rate:
+                float_data = librosa.resample(
+                    float_data,
+                    orig_sr=self.config.sample_rate,
+                    target_sr=self.target_rate
+                )
+
+            # Convert to mono if needed
+            if len(float_data.shape) > 1:
+                float_data = float_data.mean(axis=1)
+
+            # Normalize
+            float_data = librosa.util.normalize(float_data)
+
+            # Convert back to bytes
+            processed = (float_data * 32767).astype(np.int16).tobytes()
+
+            metrics = self._calculate_metrics(float_data)
+
+            await self._publish_mixer_event(
+                "transcription_prepared",
+                ProcessingResult(
+                    processed_data=processed,
+                    metrics=metrics,
+                    format=self.config.format,
+                    sample_rate=self.target_rate,
+                    channels=1,
+                    duration=len(float_data) / self.target_rate
+                )
+            )
+
+            return processed, metrics
+
+        except Exception as e:
+            raise MixerError(f"Failed to prepare for transcription: {e}")
+
+    def _to_float_array(self, audio_bytes: bytes) -> np.ndarray:
+        """Convert audio bytes to float array.
+
+        Args:
+            audio_bytes: Raw audio data
+
+        Returns:
+            Normalized float array
+        """
+        return np.frombuffer(
+            audio_bytes, dtype=np.int16
+        ).astype(np.float32) / 32768.0
+
+    def _calculate_metrics(self, audio_data: np.ndarray) -> AudioMetrics:
+        """Calculate audio metrics.
+
+        Args:
+            audio_data: Audio data array
+
+        Returns:
+            Calculated metrics
+        """
+        return AudioMetrics(
+            peak_level=float(np.max(np.abs(audio_data))),
+            rms_level=float(np.sqrt(np.mean(audio_data**2))),
+            noise_level=float(np.percentile(np.abs(audio_data), 10)),
+            clipping_count=int(np.sum(np.abs(audio_data) > 0.99)),
+            dropout_count=int(np.sum(np.abs(audio_data) < 0.01)),
+            processing_time=0.0,  # Populated by caller
+            buffer_stats={}  # Populated by caller
+        )
+
+    async def _publish_mixer_event(
+        self,
+        status: str,
+        result: ProcessingResult
+    ) -> None:
+        """Publish mixer event.
+
+        Args:
+            status: Event status
+            result: Processing result
+        """
+        await self.event_bus.publish(
+            Event(
+                type=EventType.AUDIO_CHUNK,
+                data={
+                    "status": status,
+                    # FIXME
+                    "metrics": result.metrics.dict(),
+                    "sample_rate": result.sample_rate,
+                    "channels": result.channels,
+                    "duration": result.duration
                 }
-            }
-        )))
-
-        return {
-            'combined': mixed,
-            'ch_0': mic_processed.astype(np.int16),
-            'ch_1': desktop_processed.astype(np.int16)
-        }
-
-    def create_transcription_chunk(self,
-                                   channels: Dict[str, np.ndarray]
-                                   ) -> bytes:
-        """
-        Creates a properly formatted audio chunk for AWS Transcribe.
-        For dual-channel PCM, samples are interleaved: LRLRLR...
-        """
-        # Ensure we have both channels
-        ch0 = channels.get('ch_0', np.zeros(0, dtype=np.int16))
-        ch1 = channels.get('ch_1', np.zeros(0, dtype=np.int16))
-
-        # Interleave channels
-        chunk_length = max(len(ch0), len(ch1))
-        if len(ch0) < chunk_length:
-            ch0 = np.pad(ch0, (0, chunk_length - len(ch0)))
-        if len(ch1) < chunk_length:
-            ch1 = np.pad(ch1, (0, chunk_length - len(ch1)))
-
-        # Stack and reshape to interleave
-        interleaved = np.column_stack((ch0, ch1)).ravel()
-
-        # Convert to bytes
-        return interleaved.tobytes()
-
-    def get_chunk_duration(self, chunk: bytes) -> float:
-        """Calculate the duration of an audio chunk in milliseconds"""
-        # For 16-bit dual-channel audio,
-        # each sample is 4 bytes (2 bytes per channel)
-        num_samples = len(chunk) // 4
-        return (num_samples / self.target_sample_rate) * 1000  # Convert to ms
+            )
+        )

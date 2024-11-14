@@ -1,253 +1,271 @@
-# src/audio/capture.py
+"""Audio capture and stream management."""
+from typing import Optional, Dict, Any, AsyncIterator
+from datetime import datetime
+
 import numpy as np
 import asyncio
-from typing import Optional, Dict, Any, Callable
+
+from src.events.bus import EventBus
+from src.events.types import Event, EventType
 from .devices import DeviceManager
 from .mixer import AudioMixer
 from .processor import AudioProcessor
+from .types import AudioConfig, ProcessingResult, DeviceInfo
 from .exceptions import (
     CaptureError,
     DeviceError,
+    ProcessingError,
 )
-from src.events.types import EventType, Event
-from src.events.bus import EventBus
 
 
 class AudioCapture:
-    """
-    Main audio capture class that coordinates device management,
-    mixing, and processing.
-    """
+    """Manages audio capture and processing pipeline."""
 
-    def __init__(self,
-                 event_bus: EventBus,
-                 mic_device_id: Optional[int] = None,
-                 desktop_device_id: Optional[int] = None,
-                 sample_rate: int = 44100,
-                 chunk_size: int = 1024,
-                 channels: int = 1,
-                 ):
-        """
-        Initialize audio capture.
+    def __init__(
+        self,
+        event_bus: EventBus,
+        config: AudioConfig,
+        device_id: Optional[int] = None,
+    ) -> None:
+        """Initialize audio capture.
 
         Args:
-            mic_device_id: ID of microphone device
-            desktop_device_id: ID of desktop audio device
-            sample_rate: Sample rate for capture
-            chunk_size: Size of audio chunks
-            channels: Number of channels (1 for mono, 2 for stereo)
+            event_bus: Event bus instance
+            config: Audio configuration
+            device_id: Optional device ID
         """
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.channels = channels
         self.event_bus = event_bus
+        self.config = config
+        self.device_id = device_id
 
         # Initialize components
         self.device_manager = DeviceManager()
-        self.mixer = AudioMixer(sample_rate=sample_rate,
-                                chunk_size=chunk_size)
-        self.processor = AudioProcessor(sample_rate=sample_rate)
-
-        # Validate and set devices
-        if mic_device_id and not self.device_manager.validate_device(
-                mic_device_id):
-            raise DeviceError(f"Invalid microphone device ID: {mic_device_id}")
-        if desktop_device_id and not self.device_manager.validate_device(
-                desktop_device_id):
-            raise DeviceError(
-                f"Invalid desktop device ID: {desktop_device_id}")
-
-        self.mic_device_id = mic_device_id
-        self.desktop_device_id = desktop_device_id
+        self.mixer = AudioMixer(event_bus, config)
+        self.processor = AudioProcessor(event_bus, config)
 
         # State management
-        self.is_running = False
-        self.is_paused = False
-        self._streams: Dict[str, Any] = {}
-        self._callback: Optional[Callable] = None
+        self._running = False
+        self._paused = False
+        self._stream: Optional[AsyncIterator[bytes]] = None
+        self._stats: Dict[str, Any] = {
+            "bytes_processed": 0,
+            "chunks_processed": 0,
+            "start_time": None,
+            "last_chunk": None,
+        }
 
-    async def start_capture(self,
-                            callback: Optional[Callable] = None) -> None:
-        """
-        Start capturing audio from configured devices.
+    async def start_capture(self) -> None:
+        """Start audio capture.
 
-        Args:
-            callback: Optional callback for processed audio data
+        Raises:
+            CaptureError: If capture fails to start
+            DeviceError: If device initialization fails
         """
-        if self.is_running:
+        if self._running:
             raise CaptureError("Capture already running")
 
         try:
-            # Initialize audio streams
-            if self.mic_device_id is not None:
-                mic_stream = await self._init_mic_stream()
-                self._streams['mic'] = mic_stream
+            # Validate device
+            if not await self._init_device():
+                raise DeviceError("Failed to initialize device")
 
-            if self.desktop_device_id is not None:
-                desktop_stream = await self._init_desktop_stream()
-                self._streams['desktop'] = desktop_stream
-
-            self.is_running = True
-            self._callback = callback
-
-            # Public event on start
-            await self.event_bus.publish(Event(
-                type=EventType.AUDIO_CHUNK,
-                data={
-                    "status": "capture_started",
-                }
-            ))
+            self._running = True
+            self._stats["start_time"] = datetime.now()
 
             # Start processing loop
             asyncio.create_task(self._process_audio())
+
+            await self._publish_capture_event("capture_started", {})
 
         except Exception as e:
             await self.stop_capture()
             raise CaptureError(f"Failed to start capture: {e}")
 
     async def stop_capture(self) -> None:
-        """Stop capturing audio and clean up resources."""
-        self.is_running = False
-        await self.event_bus.publish(Event(
-            type=EventType.AUDIO_CHUNK,
-            data={
-                "status": "capture_stopped",
-            }
-        ))
-        # Clean up streams
-        for stream in self._streams.values():
-            try:
-                stream.stop_stream()
-                stream.close()
-            except Exception as e:
-                print(f"Error closing stream: {e}")
+        """Stop audio capture."""
+        self._running = False
+        self._stream = None
+        self._stats["last_chunk"] = datetime.now()
 
-        self._streams.clear()
-        self._callback = None
+        await self._publish_capture_event(
+            "capture_stopped",
+            {
+                "duration": (
+                    datetime.now() - self._stats["start_time"]
+                ).total_seconds()
+                if self._stats["start_time"]
+                else 0
+            }
+        )
 
     async def pause_capture(self) -> None:
         """Pause audio capture."""
-        self.is_paused = True
+        self._paused = True
+        await self._publish_capture_event("capture_paused", {})
 
     async def resume_capture(self) -> None:
         """Resume audio capture."""
-        self.is_paused = False
+        self._paused = False
+        await self._publish_capture_event("capture_resumed", {})
 
-    async def _init_mic_stream(self) -> Any:
-        """Initialize microphone stream."""
-        try:
-            mic_stream = await self.device_manager.open_input_stream(
-                device_id=self.mic_device_id,
-                sample_rate=self.sample_rate,
-                channels=self.channels,
-                chunk_size=self.chunk_size
-            )
-            return mic_stream
-        except Exception as e:
-            raise DeviceError(f"Failed to initialize microphone: {e}")
+    async def get_levels(self) -> Dict[str, float]:
+        """Get current audio levels.
 
-    async def _init_desktop_stream(self) -> Any:
-        """Initialize desktop audio stream."""
+        Returns:
+            Dict of audio levels
+        """
+        return {
+            "peak": self._stats.get("peak_level", 0.0),
+            "rms": self._stats.get("rms_level", 0.0),
+        }
+
+    async def _init_device(self) -> bool:
+        """Initialize audio device.
+
+        Returns:
+            Whether initialization succeeded
+        """
         try:
-            desktop_stream = await self.device_manager.open_input_stream(
-                device_id=self.desktop_device_id,
-                sample_rate=self.sample_rate,
-                channels=self.channels,
-                chunk_size=self.chunk_size,
-                as_loopback=True
+            if not self.device_id:
+                device_info = await self.device_manager.get_default_device(
+                    self.config.device_type
+                )
+                if not device_info:
+                    raise DeviceError("No default device found")
+                self.device_id = device_info.id
+
+            # Validate device
+            if not await self.device_manager.validate_device(
+                self.device_id,
+                self.config
+            ):
+                raise DeviceError(
+                    f"Device {self.device_id} not compatible"
+                )
+
+            # Open stream
+            self._stream = await self.device_manager.open_stream(
+                self.device_id,
+                self.config
             )
-            return desktop_stream
+            return True
+
         except Exception as e:
-            raise DeviceError(f"Failed to initialize desktop audio: {e}")
+            await self._publish_capture_event(
+                "device_error",
+                {"error": str(e)}
+            )
+            return False
 
     async def _process_audio(self) -> None:
         """Main audio processing loop."""
-        while self.is_running:
-            if self.is_paused:
-                await asyncio.sleep(0.1)
-                continue
+        if not self._stream:
+            return
 
+        while self._running:
             try:
-                # Read from streams
-                mic_data = await self._read_stream('mic')
-                desktop_data = await self._read_stream('desktop')
+                if self._paused:
+                    await asyncio.sleep(0.1)
+                    continue
 
-                # Process audio through mixer
-                mixed = self.mixer.prepare_for_transcription(
-                    mic_data,
-                    desktop_data,
-                    self.sample_rate,
-                    self.sample_rate
-                )
+                # Get next chunk
+                async for chunk in self._stream:
+                    if not chunk or not self._running:
+                        break
 
-                # Process audio
-                processed_combined, info = self.processor.process_chunk(
-                    mixed['combined']
-                )
+                    # Process audio
+                    try:
+                        result = await self._process_chunk(chunk)
+                        await self._update_stats(result)
+                        await self._publish_capture_event(
+                            "chunk_processed",
+                            {
+                                "chunk_size": len(chunk),
+                                "metrics": result.metrics.dict()
+                            }
+                        )
+                    except ProcessingError as e:
+                        await self._publish_capture_event(
+                            "processing_error",
+                            {"error": str(e)}
+                        )
 
-                # Create result dictionary
-                result = {
-                    'combined': processed_combined,
-                    'ch_0': mixed['ch_0'],
-                    'ch_1': mixed['ch_1'],
-                    'info': info
-                }
-
-                # Call callback if set
-                if self._callback:
-                    await self._callback(result)
-
-                # Publish an event for each processed chunk
-                await self.event_bus.publish(Event(
-                    type=EventType.AUDIO_CHUNK,
-                    data={
-                        "status": "processed_chunk",
-                        "result": result
-                    }
-                ))
-
-                # Small delay to prevent CPU overload
-                await asyncio.sleep(0.001)
+                    await asyncio.sleep(0.001)
 
             except Exception as e:
-                print(f"Error in audio processing: {e}")
+                await self._publish_capture_event(
+                    "capture_error",
+                    {"error": str(e)}
+                )
                 await asyncio.sleep(0.1)
 
-    async def _read_stream(self,
-                           stream_name: str) -> Optional[np.ndarray]:
-        """Read data from specified stream."""
-        if stream_name not in self._streams:
-            return None
+    async def _process_chunk(self, chunk: bytes) -> ProcessingResult:
+        """Process audio chunk.
 
-        try:
-            stream = self._streams[stream_name]
-            data = await stream.read(self.chunk_size)
-            return np.frombuffer(data, dtype=np.int16)
-        except Exception as e:
-            print(f"Error reading from {stream_name}: {e}")
-            return None
+        Args:
+            chunk: Raw audio data
 
-    async def get_audio_levels(self) -> Dict[str, float]:
-        """Get current audio levels for monitoring."""
-        levels = {
-            'mic': -float('inf'),
-            'desktop': -float('inf')
-        }
+        Returns:
+            Processing result
 
-        for stream_name in ['mic', 'desktop']:
-            data = await self._read_stream(stream_name)
-            if data is not None:
-                data_float = data.astype(np.float32) / 32768.0
-                rms = np.sqrt(np.mean(np.square(data_float)))
-                levels[stream_name] = 20 * np.log10(rms + 1e-10)
+        Raises:
+            ProcessingError: If processing fails
+        """
+        # Mix audio if needed
+        if self.config.channels > 1:
+            result = await self.mixer.mix_streams(chunk)
+            chunk = result.processed_data
 
-        return levels
+        # Process audio
+        return await self.processor.process_chunk(
+            chunk,
+            apply_noise_reduction=self.config.enable_noise_reduction,
+            apply_gain=self.config.enable_auto_gain
+        )
 
-    def __enter__(self):
-        """Context manager entry."""
+    async def _update_stats(self, result: ProcessingResult) -> None:
+        """Update capture statistics.
+
+        Args:
+            result: Processing result
+        """
+        self._stats.update({
+            "bytes_processed": (
+                self._stats["bytes_processed"] + len(result.processed_data)
+            ),
+            "chunks_processed": self._stats["chunks_processed"] + 1,
+            "last_chunk": datetime.now(),
+            "peak_level": result.metrics.peak_level,
+            "rms_level": result.metrics.rms_level
+        })
+
+    async def _publish_capture_event(
+        self,
+        status: str,
+        data: Dict[str, Any]
+    ) -> None:
+        """Publish capture event.
+
+        Args:
+            status: Event status
+            data: Event data
+        """
+        await self.event_bus.publish(
+            Event(
+                type=EventType.AUDIO_CHUNK,
+                data={
+                    "status": status,
+                    "device_id": self.device_id,
+                    "stats": self._stats,
+                    **data
+                }
+            )
+        )
+
+    async def __aenter__(self) -> 'AudioCapture':
+        """Enter async context."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.stop_capture())
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit async context."""
+        await self.stop_capture()
