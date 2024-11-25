@@ -1,12 +1,14 @@
-"""Document processing types and models."""
+"""Core type definitions for document processing."""
+
 from enum import Enum
-from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
+from typing import Dict, Any, List, Optional, Set
 from datetime import datetime
+from pydantic import BaseModel, Field
 
 
 class DocumentType(str, Enum):
-    """Types of documents that can be processed."""
+    """Types of documents the system can process."""
+
     CV = "cv"
     JOB_DESCRIPTION = "job_description"
     TECHNICAL_SPEC = "technical_spec"
@@ -17,46 +19,73 @@ class DocumentType(str, Enum):
     GENERAL = "general"
 
 
-class ProcessingPriority(str, Enum):
-    """Processing priority levels."""
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
+class DocumentFormat(str, Enum):
+    """Supported document formats."""
+
+    PDF = "pdf"
+    CSV = "csv"
+    DOC = "doc"
+    DOCX = "docx"
+    XLS = "xls"
+    XLSX = "xlsx"
+    HTML = "html"
+    TXT = "txt"
+    MD = "md"
+
+
+class Document(BaseModel):
+    """Base document model."""
+
+    content: bytes
+    format: DocumentFormat
+    name: str
+    doc_type: DocumentType
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessedDocument(BaseModel):
+    """Fully processed document with analysis."""
+
+    id: str
+    original: Document
+    doc_type: DocumentType
+    analysis: Dict[str, Any]  # Structured analysis results
+    role_specific: Dict[str, Any]  # Role-specific insights
+    metadata: Dict[str, Any]
+    references: List[str]  # References to other documents
+    confidence: float
+    processed_at: datetime = Field(default_factory=datetime.now)
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class ProcessingContext(BaseModel):
     """Context for document processing."""
-    role: str = Field(..., description="Role performing the processing")
+
+    role: str
     document_type: DocumentType
-    purpose: str = Field(..., description="Purpose of processing")
-    priority: ProcessingPriority = Field(
-        default=ProcessingPriority.MEDIUM,
-        description="Processing priority"
-    )
-    metadata: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Additional metadata"
-    )
+    purpose: str
+    priority: str = "medium"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ProcessingResult(BaseModel):
     """Result of document processing."""
+
     document_id: str
     content_type: str
     analysis: Dict[str, Any]
     confidence: float = Field(ge=0.0, le=1.0)
     processing_time: float
     context_updates: Dict[str, Any]
+    role_specific: Dict[str, Any] = Field(default_factory=dict)
     extracted_at: datetime = Field(default_factory=datetime.now)
-    role_specific: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Role-specific analysis results",
-
-    )
 
 
 class DocumentReference(BaseModel):
     """Reference to a processed document."""
+
     id: str
     type: DocumentType
     name: str
@@ -64,25 +93,3 @@ class DocumentReference(BaseModel):
     key_points: List[str]
     relevance: float = Field(ge=0.0, le=1.0)
     context: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ContextUpdate(BaseModel):
-    """Context update from document processing."""
-    type: str
-    content: Dict[str, Any]
-    priority: ProcessingPriority
-    timestamp: datetime = Field(default_factory=datetime.now)
-    requires_action: bool = False
-    action_details: Optional[Dict[str, Any]] = None
-
-
-class ProcessedDocument(BaseModel):
-    """Processed document."""
-    document_id: str
-    document_type: DocumentType
-    content_type: str
-    content: Dict[str, Any]
-    metadata: Dict[str, Any]
-    context_updates: List[ContextUpdate]
-    extracted_at: datetime = Field(default_factory=datetime.now)
-    role_specific: Dict[str, Any] = Field(default_factory=dict)
