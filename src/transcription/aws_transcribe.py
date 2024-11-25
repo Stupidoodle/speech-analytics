@@ -1,4 +1,5 @@
 """AWS Transcribe service integration."""
+
 from typing import Dict, Any, Optional
 import asyncio
 import uuid
@@ -11,11 +12,7 @@ from .types import (
 )
 from .models import TranscriptionStore
 from .handlers import TranscriptionHandler
-from .exceptions import (
-    StreamingError,
-    ConfigurationError,
-    ConnectionError
-)
+from .exceptions import StreamingError, ConfigurationError, ConnectionError
 from src.events.bus import EventBus
 from src.events.types import Event, EventType
 
@@ -24,10 +21,10 @@ class TranscribeManager:
     """Manages AWS Transcribe streaming sessions."""
 
     def __init__(
-            self,
-            event_bus: EventBus,
-            region: str,
-            config: Optional[TranscriptionConfig] = None
+        self,
+        event_bus: EventBus,
+        region: str,
+        config: Optional[TranscriptionConfig] = None,
     ):
         """Initialize transcribe manager.
 
@@ -60,10 +57,10 @@ class TranscribeManager:
         self.client = None
 
     async def start_stream(
-            self,
-            session_id: Optional[str] = None,
-            on_result: Optional[callable] = None,
-            on_error: Optional[callable] = None
+        self,
+        session_id: Optional[str] = None,
+        on_result: Optional[callable] = None,
+        on_error: Optional[callable] = None,
     ) -> str:
         """Start transcription stream.
 
@@ -87,13 +84,12 @@ class TranscribeManager:
                 raise StreamingError("Stream already running")
 
             self.state = TranscriptionState.STARTING
-            await self.event_bus.publish(Event(
-                type=EventType.TRANSCRIPT,
-                data={
-                    "status": "stream_started",
-                    "session_id": session_id
-                }
-            ))
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.TRANSCRIPT,
+                    data={"status": "stream_started", "session_id": session_id},
+                )
+            )
             session_id = session_id or str(uuid.uuid4())
 
             # Create stream configuration
@@ -107,7 +103,7 @@ class TranscribeManager:
                 "enable_channel_identification": (
                     self.config.enable_channel_identification
                 ),
-                "number_of_channels": self.config.number_of_channels
+                "number_of_channels": self.config.number_of_channels,
             }
 
             # Start AWS stream
@@ -123,7 +119,7 @@ class TranscribeManager:
                 self.store,
                 session_id,
                 on_result,
-                on_error
+                on_error,
             )
 
             # Start handler
@@ -140,10 +136,10 @@ class TranscribeManager:
             raise StreamingError(f"Failed to start stream: {e}")
 
     async def process_audio(
-            self,
-            chunk: bytes,
-            # session_id: str,
-            # channel: Optional[str] = None
+        self,
+        chunk: bytes,
+        # session_id: str,
+        # channel: Optional[str] = None
     ) -> None:
         """Process audio chunk.
 
@@ -162,16 +158,13 @@ class TranscribeManager:
             if not self.current_stream:
                 raise StreamingError("Stream not initialized")
 
-            await self.current_stream.input_stream.send_audio_event(
-                audio_chunk=chunk
+            await self.current_stream.input_stream.send_audio_event(audio_chunk=chunk)
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.AUDIO_CHUNK,
+                    data={"status": "audio_chunk_sent", "chunk_size": len(chunk)},
+                )
             )
-            await self.event_bus.publish(Event(
-                type=EventType.AUDIO_CHUNK,
-                data={
-                    "status": "audio_chunk_sent",
-                    "chunk_size": len(chunk)
-                }
-            ))
 
         except Exception as e:
             self.state = TranscriptionState.ERROR
@@ -179,8 +172,7 @@ class TranscribeManager:
             raise StreamingError(f"Failed to process audio: {e}")
 
     async def stop_stream(
-            self,
-            session_id: Optional[str] = None
+        self, session_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Stop transcription stream.
 
@@ -195,8 +187,8 @@ class TranscribeManager:
         """
         try:
             if self.state not in (
-                    TranscriptionState.STREAMING,
-                    TranscriptionState.ERROR
+                TranscriptionState.STREAMING,
+                TranscriptionState.ERROR,
             ):
                 return None
 
@@ -209,8 +201,7 @@ class TranscribeManager:
             results = None
             if session_id:
                 results = self.store.get_session_results(
-                    session_id,
-                    include_partial=False
+                    session_id, include_partial=False
                 )
                 self.store.cleanup_session(session_id)
 
@@ -219,13 +210,12 @@ class TranscribeManager:
             self.state = TranscriptionState.IDLE
             self._error = None
 
-            await self.event_bus.publish(Event(
-                type=EventType.TRANSCRIPT,
-                data={
-                    "status": "stream_stopped",
-                    "session_id": session_id
-                }
-            ))
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.TRANSCRIPT,
+                    data={"status": "stream_stopped", "session_id": session_id},
+                )
+            )
 
             return results
 
@@ -235,9 +225,7 @@ class TranscribeManager:
             raise StreamingError(f"Failed to stop stream: {e}")
 
     async def get_results(
-            self,
-            session_id: str,
-            include_partial: bool = False
+        self, session_id: str, include_partial: bool = False
     ) -> Dict[str, Any]:
         """Get results for session.
 
@@ -248,10 +236,7 @@ class TranscribeManager:
         Returns:
             Session results
         """
-        return self.store.get_session_results(
-            session_id,
-            include_partial
-        )
+        return self.store.get_session_results(session_id, include_partial)
 
     @property
     def status(self) -> Dict[str, Any]:
@@ -263,7 +248,7 @@ class TranscribeManager:
         return {
             "state": self.state.value,
             "error": self._error,
-            "sessions": len(self.store.sessions)
+            "sessions": len(self.store.sessions),
         }
 
     async def _run_handler(self) -> None:
