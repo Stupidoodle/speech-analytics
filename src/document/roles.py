@@ -148,7 +148,41 @@ class DocumentRoles:
                             "key_points": ["point1", "point2"]
                         }
                     ]
-                }"""
+                }""",
+                DocumentType.CV: """{
+                    "alignment_with_requirements": [
+                        {
+                            "requirement": "requirement description",
+                            "your_experience": "relevant experience or achievement",
+                            "action_plan": ["action1", "action2"]
+                        }
+                    ],
+                    "key_achievements": [
+                        {
+                            "achievement": "achievement description",
+                            "context": "context in which the achievement was made",
+                            "impact": "result or outcome",
+                            "talking_points": ["point1", "point2"]
+                        }
+                    ],
+                    "project_expansion": [
+                        {
+                            "project_name": "name of the project",
+                            "your_role": "specific role in the project",
+                            "key_contributions": ["contribution1", "contribution2"],
+                            "technologies_used": ["tech1", "tech2"],
+                            "learning_opportunities": ["learning1", "learning2"]
+                        }
+                    ],
+                    "technical_expertise": [
+                        {
+                            "area": "technical area",
+                            "tools_and_technologies": ["tool1", "tool2"],
+                            "relevant_experience": "summary of relevant experience",
+                            "example_projects": ["project1", "project2"]
+                        }
+                    ]
+                }""",
             },
         )
 

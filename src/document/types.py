@@ -76,7 +76,6 @@ class ProcessingResult(BaseModel):
     document_id: str
     content_type: str
     analysis: Dict[str, Any]
-    confidence: float = Field(ge=0.0, le=1.0)
     processing_time: float
     context_updates: Dict[str, Any]
     role_specific: Dict[str, Any] = Field(default_factory=dict)
