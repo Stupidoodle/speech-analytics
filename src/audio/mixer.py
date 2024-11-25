@@ -1,175 +1,110 @@
 """Audio stream mixing and channel management."""
-from typing import Dict, Optional, Tuple
+
+from dataclasses import asdict
+from typing import Optional
 
 import numpy as np
-import librosa
 
 from src.events.bus import EventBus
 from src.events.types import Event, EventType
+
 from .exceptions import MixerError
-from .types import AudioConfig, ProcessingResult, AudioMetrics
+from .types import AudioConfig, AudioMetrics, ProcessingResult
 
 
 class AudioMixer:
-    """Handles mixing and processing of audio streams."""
+    """Handles mixing of audio streams into stereo format."""
 
-    def __init__(
-        self,
-        event_bus: EventBus,
-        config: AudioConfig,
-    ) -> None:
+    def __init__(self, event_bus: EventBus, config: AudioConfig) -> None:
         """Initialize audio mixer.
 
         Args:
-            event_bus: Event bus instance
-            config: Audio configuration
+            event_bus (EventBus): Event bus instance.
+            config (AudioConfig): Audio configuration containing sample rate and channels.
         """
         self.event_bus = event_bus
         self.config = config
-        self.target_rate = 16000  # Target sample rate for transcription
 
     async def mix_streams(
-        self,
-        primary: bytes,
-        secondary: Optional[bytes] = None,
-        primary_gain: float = 1.0,
-        secondary_gain: float = 0.7
+        self, primary: bytes, secondary: Optional[bytes] = None
     ) -> ProcessingResult:
-        """Mix two audio streams with gain control.
+        """Mix two audio streams into a stereo PCM format.
 
         Args:
-            primary: Primary audio stream
-            secondary: Optional secondary stream
-            primary_gain: Gain for primary stream
-            secondary_gain: Gain for secondary stream
+            primary (bytes): Primary audio stream (left channel).
+            secondary (Optional[bytes]): Secondary audio stream (right channel).
 
         Returns:
-            Mixed audio result
+            ProcessingResult: The mixed audio as a stereo PCM stream.
 
         Raises:
-            MixerError: If mixing fails
+            MixerError: If mixing fails.
         """
         try:
-            # Convert to float arrays
+            # Convert audio bytes to float arrays
             primary_arr = self._to_float_array(primary)
-            if secondary is not None:
-                secondary_arr = self._to_float_array(secondary)
-                # Ensure same length
-                length = min(len(primary_arr), len(secondary_arr))
-                primary_arr = primary_arr[:length]
-                secondary_arr = secondary_arr[:length]
-            else:
-                secondary_arr = None
+            secondary_arr = (
+                self._to_float_array(secondary)
+                if secondary
+                else np.zeros_like(primary_arr)
+            )
 
-            # Apply gain and mix
-            primary_arr *= primary_gain
-            if secondary_arr is not None:
-                secondary_arr *= secondary_gain
-                mixed = primary_arr + secondary_arr
-            else:
-                mixed = primary_arr
+            # Ensure both streams are of the same length
+            min_length = min(len(primary_arr), len(secondary_arr))
+            primary_arr = primary_arr[:min_length]
+            secondary_arr = secondary_arr[:min_length]
 
-            # Clip to prevent overflow
-            mixed = np.clip(mixed, -1.0, 1.0)
+            # Interleave streams into stereo format
+            stereo_audio = np.empty((min_length * 2,), dtype=np.float32)
+            stereo_audio[0::2] = primary_arr  # Left channel
+            stereo_audio[1::2] = secondary_arr  # Right channel
 
-            # Convert back to bytes
-            mixed_bytes = (mixed * 32767).astype(np.int16).tobytes()
+            # Clip values to prevent overflow
+            stereo_audio = np.clip(stereo_audio, -1.0, 1.0)
 
-            metrics = self._calculate_metrics(mixed)
+            # Convert back to PCM bytes
+            stereo_bytes = (stereo_audio * 32767).astype(np.int16).tobytes()
 
-            # Create result
+            # Calculate metrics for the mixed audio
+            metrics = self._calculate_metrics(stereo_audio)
+
             result = ProcessingResult(
-                processed_data=mixed_bytes,
+                processed_data=stereo_bytes,
                 metrics=metrics,
                 format=self.config.format,
                 sample_rate=self.config.sample_rate,
-                channels=self.config.channels,
-                duration=len(mixed) / self.config.sample_rate
+                channels=2,
+                duration=len(stereo_audio) / (self.config.sample_rate * 2),
             )
 
+            # Publish event
             await self._publish_mixer_event("mix_complete", result)
             return result
 
         except Exception as e:
             raise MixerError(f"Failed to mix streams: {e}")
 
-    async def prepare_for_transcription(
-        self,
-        audio_data: bytes,
-    ) -> Tuple[bytes, AudioMetrics]:
-        """Prepare audio for transcription.
+    @staticmethod
+    def _to_float_array(audio_bytes: bytes) -> np.ndarray:
+        """Convert PCM audio bytes to normalized float array.
 
         Args:
-            audio_data: Raw audio data
+            audio_bytes (bytes): PCM audio data.
 
         Returns:
-            Processed audio and metrics
-
-        Raises:
-            MixerError: If processing fails
+            np.ndarray: Normalized float array.
         """
-        try:
-            # Convert to float array
-            float_data = self._to_float_array(audio_data)
+        return np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Resample if needed
-            if self.config.sample_rate != self.target_rate:
-                float_data = librosa.resample(
-                    float_data,
-                    orig_sr=self.config.sample_rate,
-                    target_sr=self.target_rate
-                )
-
-            # Convert to mono if needed
-            if len(float_data.shape) > 1:
-                float_data = float_data.mean(axis=1)
-
-            # Normalize
-            float_data = librosa.util.normalize(float_data)
-
-            # Convert back to bytes
-            processed = (float_data * 32767).astype(np.int16).tobytes()
-
-            metrics = self._calculate_metrics(float_data)
-
-            await self._publish_mixer_event(
-                "transcription_prepared",
-                ProcessingResult(
-                    processed_data=processed,
-                    metrics=metrics,
-                    format=self.config.format,
-                    sample_rate=self.target_rate,
-                    channels=1,
-                    duration=len(float_data) / self.target_rate
-                )
-            )
-
-            return processed, metrics
-
-        except Exception as e:
-            raise MixerError(f"Failed to prepare for transcription: {e}")
-
-    def _to_float_array(self, audio_bytes: bytes) -> np.ndarray:
-        """Convert audio bytes to float array.
+    @staticmethod
+    def _calculate_metrics(audio_data: np.ndarray) -> AudioMetrics:
+        """Calculate audio metrics for the mixed stream.
 
         Args:
-            audio_bytes: Raw audio data
+            audio_data (np.ndarray): Mixed audio data array.
 
         Returns:
-            Normalized float array
-        """
-        return np.frombuffer(
-            audio_bytes, dtype=np.int16
-        ).astype(np.float32) / 32768.0
-
-    def _calculate_metrics(self, audio_data: np.ndarray) -> AudioMetrics:
-        """Calculate audio metrics.
-
-        Args:
-            audio_data: Audio data array
-
-        Returns:
-            Calculated metrics
+            AudioMetrics: Calculated audio metrics.
         """
         return AudioMetrics(
             peak_level=float(np.max(np.abs(audio_data))),
@@ -177,31 +112,27 @@ class AudioMixer:
             noise_level=float(np.percentile(np.abs(audio_data), 10)),
             clipping_count=int(np.sum(np.abs(audio_data) > 0.99)),
             dropout_count=int(np.sum(np.abs(audio_data) < 0.01)),
-            processing_time=0.0,  # Populated by caller
-            buffer_stats={}  # Populated by caller
+            processing_time=0.0,  # Populated during processing
+            buffer_stats={},  # Placeholder for additional stats
         )
 
-    async def _publish_mixer_event(
-        self,
-        status: str,
-        result: ProcessingResult
-    ) -> None:
-        """Publish mixer event.
+    async def _publish_mixer_event(self, status: str, result: ProcessingResult) -> None:
+        """Publish an event about the mixing process.
 
         Args:
-            status: Event status
-            result: Processing result
+            status (str): Status of the event.
+            result (ProcessingResult): Mixed audio data and metrics.
         """
+        # noinspection PyTypeChecker
         await self.event_bus.publish(
             Event(
                 type=EventType.AUDIO_CHUNK,
                 data={
                     "status": status,
-                    # FIXME
-                    "metrics": result.metrics.dict(),
+                    "metrics": asdict(result.metrics),
                     "sample_rate": result.sample_rate,
                     "channels": result.channels,
-                    "duration": result.duration
-                }
+                    "duration": result.duration,
+                },
             )
         )

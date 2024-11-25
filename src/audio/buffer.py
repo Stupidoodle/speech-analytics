@@ -1,66 +1,58 @@
-"""Audio buffer management for transcription streaming."""
-from collections import deque
-from datetime import datetime
-from typing import Dict, Optional, AsyncIterator, Set
+"""Audio buffer management for stereo transcription streaming."""
 
 import asyncio
+from collections import deque
+from datetime import datetime
+from typing import AsyncIterator, Dict, Optional
 
 from src.events.bus import EventBus
 from src.events.types import Event, EventType
+
 from .exceptions import BufferError
-from .types import AudioConfig, BufferMetrics, BufferStatus
+from .types import AudioConfig, BufferMetrics, BufferStatus, ChannelConfig
 
 
 class AudioBuffer:
-    """Manages buffering of audio data for transcription streams."""
+    """Manages buffering of stereo audio data for transcription."""
 
     def __init__(
-            self,
-            event_bus: EventBus,
-            config: AudioConfig,
-            max_size: int = 32768,  # 32KB default
-            chunk_size: int = 1024,  # 1KB chunks
-    ) -> None:
+        self,
+        event_bus: EventBus,
+        config: AudioConfig,
+        max_size: int = 32768,  # 32KB default
+    ):
         """Initialize audio buffer.
 
         Args:
             event_bus: Event bus instance
             config: Audio configuration
             max_size: Maximum buffer size in bytes
-            chunk_size: Size of chunks to return
         """
         self.event_bus = event_bus
         self.config = config
         self.max_size = max_size
-        self.chunk_size = chunk_size
+        self.chunk_size = config.chunk_size
 
         # Initialize channel buffers
         self._buffers: Dict[str, deque] = {
-            "main": deque(),
-            "channel_1": deque(),
+            # Combined stereo buffer
+            "combined": deque(),
+            # Individual channel buffers
+            "ch_0": deque(),  # Left channel (mic)
+            "ch_1": deque(),  # Right channel (desktop)
         }
-        if config.channels > 1:
-            self._buffers["channel_2"] = deque()
 
         # Track buffer sizes
-        self._sizes: Dict[str, int] = {k: 0 for k in self._buffers}
+        self._sizes = {k: 0 for k in self._buffers}
 
         # Track timestamps
-        self._last_write: Dict[str, Optional[datetime]] = {
-            k: None for k in self._buffers
-        }
-        self._last_read: Dict[str, Optional[datetime]] = {
-            k: None for k in self._buffers
-        }
+        self._last_write = {k: None for k in self._buffers}
+        self._last_read = {k: None for k in self._buffers}
 
         # Initialize metrics
         self._metrics = BufferMetrics()
 
-    async def write(
-            self,
-            data: bytes,
-            channel: Optional[str] = None
-    ) -> None:
+    async def write(self, data: bytes, channel: Optional[str] = None) -> None:
         """Write audio data to buffer.
 
         Args:
@@ -68,13 +60,14 @@ class AudioBuffer:
             channel: Optional channel identifier
 
         Raises:
-            BufferError: If buffer would overflow or invalid channel
+            BufferError: If buffer would overflow
         """
         try:
-            if len(data) % 2 != 0:  # Validate 16-bit samples
-                raise BufferError("Invalid sample alignment")
+            # Validate data alignment for stereo
+            if len(data) % (2 * self.config.channels) != 0:
+                raise BufferError("Invalid stereo sample alignment")
 
-            buffer_key = channel or "main"
+            buffer_key = channel or "combined"
             if buffer_key not in self._buffers:
                 raise BufferError(f"Invalid channel: {buffer_key}")
 
@@ -83,17 +76,33 @@ class AudioBuffer:
 
             # Handle overflow
             if current_size + len(data) > self.max_size:
+                bytes_to_remove = current_size + len(data) - self.max_size
+                bytes_removed = 0
+
+                while bytes_removed < bytes_to_remove:
+                    try:
+                        removed = buffer.popleft()
+                        bytes_removed += len(removed)
+                        current_size -= len(removed)
+                    except IndexError:  # Handle underflow during overflow handling
+                        break
+
                 self._metrics.overflow_count += 1
-                while current_size + len(data) > self.max_size:
-                    removed = buffer.popleft()
-                    current_size -= len(removed)
-                    self._sizes[buffer_key] = current_size
 
             # Add new data
             buffer.append(data)
-            self._sizes[buffer_key] = current_size + len(data)
+            new_size = current_size + len(data)
+            self._sizes[buffer_key] = min(new_size, self.max_size)
+
             self._last_write[buffer_key] = datetime.now()
             self._metrics.total_bytes_written += len(data)
+
+            # If writing combined stereo, split into channels
+            if (
+                buffer_key == "combined"
+                and self.config.channel_config == ChannelConfig.STEREO
+            ):
+                await self._split_stereo_channels(data)
 
             await self._publish_buffer_event("write_complete", len(data))
 
@@ -102,11 +111,32 @@ class AudioBuffer:
         except Exception as e:
             raise BufferError(f"Write failed: {str(e)}")
 
+    async def _split_stereo_channels(self, data: bytes) -> None:
+        """Split stereo data into separate channel buffers.
+
+        Args:
+            data: Stereo audio data
+        """
+        # Calculate sample size (2 bytes for 16-bit audio)
+        sample_size = 2
+        frame_size = sample_size * self.config.channels
+
+        # Split the stereo data
+        for i in range(0, len(data), frame_size):
+            frame = data[i : i + frame_size]
+            if len(frame) == frame_size:
+                # Left channel (first 2 bytes)
+                self._buffers["ch_0"].append(frame[:sample_size])
+                self._sizes["ch_0"] += sample_size
+                # Right channel (second 2 bytes)
+                self._buffers["ch_1"].append(frame[sample_size:])
+                self._sizes["ch_1"] += sample_size
+
     async def read(
-            self,
-            size: Optional[int] = None,
-            channel: Optional[str] = None,
-            timeout: Optional[float] = None
+        self,
+        size: Optional[int] = None,
+        channel: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Optional[bytes]:
         """Read audio data from buffer.
 
@@ -117,13 +147,10 @@ class AudioBuffer:
 
         Returns:
             Audio data if available, None otherwise
-
-        Raises:
-            BufferError: If read fails
         """
         try:
             read_size = size or self.chunk_size
-            buffer_key = channel or "main"
+            buffer_key = channel or "combined"
 
             if buffer_key not in self._buffers:
                 raise BufferError(f"Invalid channel: {buffer_key}")
@@ -131,12 +158,20 @@ class AudioBuffer:
             buffer = self._buffers[buffer_key]
             current_size = self._sizes[buffer_key]
 
+            # Ensure proper size alignment for stereo
+            if buffer_key == "combined":
+                read_size = (read_size // (2 * self.config.channels)) * (
+                    2 * self.config.channels
+                )
+            else:
+                read_size = (read_size // 2) * 2
+
             # Wait for data if timeout specified
             if timeout and current_size < read_size:
                 start = datetime.now()
                 while (
-                        current_size < read_size and
-                        (datetime.now() - start).total_seconds() < timeout
+                    current_size < read_size
+                    and (datetime.now() - start).total_seconds() < timeout
                 ):
                     await asyncio.sleep(0.001)
                     current_size = self._sizes[buffer_key]
@@ -174,10 +209,7 @@ class AudioBuffer:
         except Exception as e:
             raise BufferError(f"Read failed: {str(e)}")
 
-    async def read_stream(
-            self,
-            channel: Optional[str] = None
-    ) -> AsyncIterator[bytes]:
+    async def read_stream(self, channel: Optional[str] = None) -> AsyncIterator[bytes]:
         """Stream audio data from buffer.
 
         Args:
@@ -199,37 +231,12 @@ class AudioBuffer:
         Returns:
             Buffer status information
         """
-        active_channels: Set[str] = {
-            k for k, v in self._sizes.items() if v > 0
-        }
-
         return BufferStatus(
-            levels={
-                k: (v / self.max_size) * 100
-                for k, v in self._sizes.items()
-            },
-            latencies={
-                k: self._calculate_latency(k)
-                for k in self._buffers.keys()
-            },
-            active_channels=active_channels,
-            metrics=self._metrics
+            levels={k: (v / self.max_size) * 100 for k, v in self._sizes.items()},
+            latencies={k: self._calculate_latency(k) for k in self._buffers.keys()},
+            active_channels={k for k, v in self._sizes.items() if v > 0},
+            metrics=self._metrics,
         )
-
-    def clear(self, channel: Optional[str] = None) -> None:
-        """Clear buffer contents.
-
-        Args:
-            channel: Optional channel to clear
-        """
-        if channel:
-            if channel in self._buffers:
-                self._buffers[channel].clear()
-                self._sizes[channel] = 0
-        else:
-            for key in self._buffers:
-                self._buffers[key].clear()
-                self._sizes[key] = 0
 
     def _calculate_latency(self, channel: str) -> float:
         """Calculate buffer latency in milliseconds.
@@ -240,14 +247,11 @@ class AudioBuffer:
         Returns:
             Latency in milliseconds
         """
-        samples = self._sizes[channel] // 2  # 16-bit samples
-        return (samples / self.config.sample_rate) * 1000
+        bytes_per_frame = 2 * (2 if channel == "combined" else 1)  # 2 bytes per sample
+        frames = self._sizes[channel] // bytes_per_frame
+        return (frames / self.config.sample_rate) * 1000
 
-    async def _publish_buffer_event(
-            self,
-            status: str,
-            bytes_processed: int
-    ) -> None:
+    async def _publish_buffer_event(self, status: str, bytes_processed: int) -> None:
         """Publish buffer event.
 
         Args:
@@ -260,8 +264,7 @@ class AudioBuffer:
                 data={
                     "status": status,
                     "bytes_processed": bytes_processed,
-                    # Changed .dict() to .model_dump()
-                    "buffer_status": self.get_status().model_dump()
-                }
+                    "buffer_status": self.get_status().model_dump(),
+                },
             )
         )

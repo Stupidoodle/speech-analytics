@@ -1,18 +1,19 @@
 """Audio processing exceptions."""
-from typing import Dict, Any, Optional
+
+from typing import Any, Dict, Optional
 
 
 class AudioError(Exception):
     """Base exception for audio processing errors."""
 
-    def __init__(
-        self,
-        message: str,
-        details: Optional[Dict[str, Any]] = None
-    ) -> None:
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(message)
         self.message = message
         self.details = details or {}
+
+
+class CaptureError(AudioError):
+    """Error in audio capture."""
 
 
 class DeviceError(AudioError):
@@ -26,12 +27,9 @@ class DeviceNotFoundError(DeviceError):
         self,
         device_id: int,
         message: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
-        super().__init__(
-            message or f"Device not found: {device_id}",
-            details
-        )
+        super().__init__(message or f"Device not found: {device_id}", details)
         self.device_id = device_id
 
 
@@ -42,7 +40,7 @@ class DeviceConfigError(DeviceError):
         self,
         message: str,
         config: Dict[str, Any],
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message, details)
         self.config = config
@@ -55,12 +53,9 @@ class DeviceInUseError(DeviceError):
         self,
         device_id: int,
         message: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
-        super().__init__(
-            message or f"Device in use: {device_id}",
-            details
-        )
+        super().__init__(message or f"Device in use: {device_id}", details)
         self.device_id = device_id
 
 
@@ -71,7 +66,7 @@ class ProcessingError(AudioError):
         self,
         message: str,
         processing_step: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message, details)
         self.processing_step = processing_step
@@ -84,7 +79,7 @@ class MixerError(AudioError):
         self,
         message: str,
         channels: Optional[Dict[str, Any]] = None,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message, details)
         self.channels = channels
@@ -97,7 +92,7 @@ class BufferError(AudioError):
         self,
         message: str,
         buffer_stats: Optional[Dict[str, Any]] = None,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message, details)
         self.buffer_stats = buffer_stats
@@ -107,10 +102,7 @@ class FormatError(AudioError):
     """Error in audio format handling."""
 
     def __init__(
-        self,
-        message: str,
-        format_type: str,
-        details: Optional[Dict[str, Any]] = None
+        self, message: str, format_type: str, details: Optional[Dict[str, Any]] = None
     ) -> None:
         super().__init__(message, details)
         self.format_type = format_type
@@ -123,7 +115,7 @@ class CalibrationError(AudioError):
         self,
         message: str,
         calibration_type: str,
-        details: Optional[Dict[str, Any]] = None
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message, details)
         self.calibration_type = calibration_type

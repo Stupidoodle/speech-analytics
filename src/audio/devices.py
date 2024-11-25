@@ -1,316 +1,200 @@
-"""Audio device management and configuration."""
-from typing import Dict, List, Optional, AsyncIterator
+"""Enhanced Device Manager with pyaudiowpatch support."""
+
 import asyncio
+from typing import AsyncIterator, Dict, List, Optional
+
 import pyaudiowpatch as pyaudio
 
-from .exceptions import DeviceError, DeviceNotFoundError
-from .types import DeviceInfo, DeviceType, AudioConfig
+from .exceptions import DeviceError
+from .types import AudioConfig, DeviceInfo, DeviceType
 
 
 class DeviceManager:
-    """Manages audio device discovery and configuration."""
+    """Manages audio device discovery, validation, and streaming with pyaudiowpatch."""
 
     def __init__(self) -> None:
-        """Initialize device manager."""
-        self._audio = pyaudio.PyAudio()
-        try:
-            self._wasapi_info = self._audio.get_host_api_info_by_type(
-                pyaudio.paWASAPI
-            )
-        except Exception as e:
-            raise DeviceError(f"Failed to initialize WASAPI: {e}")
-
-    async def list_devices(self) -> List[DeviceInfo]:
-        """List available audio devices.
-
-        Returns:
-            List of available devices
+        """Initializes the device manager with WASAPI support.
 
         Raises:
-            DeviceError: If device listing fails
+            DeviceError: If WASAPI initialization fails.
+        """
+        try:
+            with pyaudio.PyAudio() as audio_manager:
+                self._wasapi_info = audio_manager.get_host_api_info_by_type(
+                    pyaudio.paWASAPI
+                )
+        except Exception as e:
+            raise DeviceError(
+                "Failed to initialize WASAPI. Ensure it is supported.",
+                {"error": str(e)},
+            )
+
+    async def list_devices(self) -> List[DeviceInfo]:
+        """Lists all available audio devices, including loopback devices.
+
+        Returns:
+            List[DeviceInfo]: A list of available audio devices.
+
+        Raises:
+            DeviceError: If device listing fails.
         """
         try:
             devices = []
-            for info in self._audio.get_device_info_generator():
-                # Skip invalid devices
-                if not info or info.get('maxInputChannels', 0) <= 0:
-                    continue
-
-                device_type = self._determine_device_type(info)
-                devices.append(
-                    DeviceInfo(
-                        id=info['index'],
-                        name=info['name'],
-                        type=device_type,
-                        channels=info['maxInputChannels'],
-                        sample_rate=int(info['defaultSampleRate']),
-                        is_default=self._is_default_device(info),
-                        is_loopback='Loopback' in info['name'],
-                        supports_input=info['maxInputChannels'] > 0,
-                        supports_output=info['maxOutputChannels'] > 0
-                    )
-                )
+            with pyaudio.PyAudio() as audio_manager:
+                print("Debug: PyAudio instance created")
+                for info in audio_manager.get_device_info_generator():
+                    if info:
+                        devices.append(self._parse_device_info(info))
             return devices
-
         except Exception as e:
-            raise DeviceError(f"Failed to list devices: {e}")
+            raise DeviceError("Failed to list devices.", {"error": str(e)})
 
-    async def get_default_device(
-        self,
-        device_type: DeviceType
-    ) -> Optional[DeviceInfo]:
-        """Get default device of specified type.
-
-        Args:
-            device_type: Type of device to get
+    async def get_default_stereo_devices(self) -> Dict[str, DeviceInfo]:
+        """Retrieves the default microphone and desktop loopback devices.
 
         Returns:
-            Default device if found
+            Dict[str, DeviceInfo]: A dictionary containing the default microphone
+            and desktop loopback devices.
 
         Raises:
-            DeviceError: If device query fails
+            DeviceError: If default devices cannot be retrieved or validated.
+        """
+        try:
+            with pyaudio.PyAudio() as audio_manager:
+                mic_device = self._get_default_device(audio_manager, DeviceType.INPUT)
+                desktop_device = self._get_default_device(
+                    audio_manager, DeviceType.OUTPUT
+                )
+
+                if not desktop_device.get("isLoopbackDevice", False):
+                    desktop_device = self._find_loopback_device(
+                        audio_manager, desktop_device
+                    )
+
+                if not mic_device or not desktop_device:
+                    raise DeviceError("Failed to locate default stereo devices.")
+
+                return {
+                    "mic": self._parse_device_info(mic_device),
+                    "desktop": self._parse_device_info(desktop_device),
+                }
+        except Exception as e:
+            raise DeviceError(
+                "Failed to retrieve default stereo devices.", {"error": str(e)}
+            )
+
+    @staticmethod
+    async def open_stream(
+        device: DeviceInfo, config: AudioConfig
+    ) -> AsyncIterator[bytes]:
+        """Opens an audio stream for the specified device.
+
+        Args:
+            device (DeviceInfo): The device to open a stream for.
+            config (AudioConfig): Configuration for the audio stream.
+
+        Yields:
+            AsyncIterator[bytes]: The audio stream as chunks of bytes.
+
+        Raises:
+            DeviceError: If the stream cannot be opened.
+        """
+        try:
+            with pyaudio.PyAudio() as audio_manager:
+                stream = None
+                try:
+                    stream = audio_manager.open(
+                        format=pyaudio.paInt16,
+                        channels=config.channels,
+                        rate=config.sample_rate,
+                        input=True,
+                        input_device_index=device.id,
+                        frames_per_buffer=config.chunk_size,
+                    )
+                    while stream.is_active():
+                        yield await asyncio.to_thread(stream.read, config.chunk_size)
+                finally:
+                    if stream:
+                        stream.close()
+        except Exception as e:
+            raise DeviceError(
+                f"Failed to open stream for device {device.name}.", {"error": str(e)}
+            )
+
+    @staticmethod
+    def _get_default_device(
+        audio_manager: pyaudio.PyAudio, device_type: DeviceType
+    ) -> Optional[Dict]:
+        """Retrieves the default device of the specified type.
+
+        Args:
+            audio_manager (pyaudio.PyAudio): The PyAudio instance.
+            device_type (DeviceType): The type of device (INPUT, OUTPUT, LOOPBACK).
+
+        Returns:
+            Optional[Dict]: Information about the default device, or None if not found.
         """
         try:
             if device_type == DeviceType.INPUT:
-                return await self._get_default_input()
+                return audio_manager.get_default_wasapi_device(d_in=True)
             elif device_type == DeviceType.OUTPUT:
-                return await self._get_default_output()
-            else:
-                return await self._get_default_loopback()
-
-        except Exception as e:
-            raise DeviceError(f"Failed to get default device: {e}")
-
-    async def open_stream(
-        self,
-        device_id: int,
-        config: AudioConfig
-    ) -> AsyncIterator[bytes]:
-        """Open audio stream for device.
-
-        Args:
-            device_id: Device identifier
-            config: Stream configuration
-
-        Yields:
-            Audio data chunks
-
-        Raises:
-            DeviceError: If stream creation fails
-            DeviceNotFoundError: If device not found
-        """
-        try:
-            # Validate device
-            device_info = self._audio.get_device_info_by_index(device_id)
-            if not device_info:
-                raise DeviceNotFoundError(
-                    device_id,
-                    "Device not found"
-                )
-
-            # Configure stream
-            stream = self._audio.open(
-                format=pyaudio.paInt16,
-                channels=config.channels,
-                rate=config.sample_rate,
-                input=True,
-                input_device_index=device_id,
-                frames_per_buffer=config.chunk_size,
-                stream_callback=None
-            )
-
-            try:
-                while stream.is_active():
-                    data = await self._read_stream(stream, config.chunk_size)
-                    if data:
-                        yield data
-                    await asyncio.sleep(0.001)
-            finally:
-                stream.stop_stream()
-                stream.close()
-
-        except DeviceNotFoundError:
-            raise
-        except Exception as e:
-            raise DeviceError(f"Stream creation failed: {e}")
-
-    async def validate_device(
-        self,
-        device_id: int,
-        config: AudioConfig
-    ) -> bool:
-        """Validate device compatibility.
-
-        Args:
-            device_id: Device identifier
-            config: Audio configuration
-
-        Returns:
-            Whether device is compatible
-
-        Raises:
-            DeviceNotFoundError: If device not found
-        """
-        try:
-            device_info = self._audio.get_device_info_by_index(device_id)
-            if not device_info:
-                raise DeviceNotFoundError(
-                    device_id,
-                    "Device not found"
-                )
-
-            return (
-                device_info['maxInputChannels'] >= config.channels and
-                self._supports_sample_rate(device_info, config.sample_rate)
-            )
-
-        except DeviceNotFoundError:
-            raise
+                return audio_manager.get_default_wasapi_device(d_out=True)
+            return None
         except Exception:
-            return False
+            return None
 
-    def _determine_device_type(self, info: Dict) -> DeviceType:
-        """Determine device type from info.
+    @staticmethod
+    def _find_loopback_device(
+        audio_manager: pyaudio.PyAudio, device_info: Dict
+    ) -> Optional[Dict]:
+        """Finds the loopback device corresponding to the default output device.
 
         Args:
-            info: Device information
+            audio_manager (pyaudio.PyAudio): The PyAudio instance.
+            device_info (Dict): Information about the default output device.
 
         Returns:
-            Determined device type
+            Optional[Dict]: The loopback device, or None if not found.
         """
-        if 'Loopback' in info['name']:
+        for loopback in audio_manager.get_loopback_device_info_generator():
+            if device_info["name"] in loopback["name"]:
+                return loopback
+        return None
+
+    def _parse_device_info(self, info: Dict) -> DeviceInfo:
+        """Parses raw device information into a structured DeviceInfo object.
+
+        Args:
+            info (Dict): Raw device information.
+
+        Returns:
+            DeviceInfo: Parsed device information.
+        """
+        return DeviceInfo(
+            id=info["index"],
+            name=info["name"],
+            type=self._determine_device_type(info),
+            channels=info["maxInputChannels"] if "maxInputChannels" in info else 0,
+            sample_rate=int(info["defaultSampleRate"]),
+            is_default=info.get("isDefault", False),
+            is_loopback=info.get("isLoopbackDevice", False),
+            supports_input=info.get("maxInputChannels", 0) > 0,
+            supports_output=info.get("maxOutputChannels", 0) > 0,
+        )
+
+    @staticmethod
+    def _determine_device_type(info: Dict) -> DeviceType:
+        """Determines the type of device based on its properties.
+
+        Args:
+            info (Dict): Raw device information.
+
+        Returns:
+            DeviceType: The determined device type (INPUT, OUTPUT, LOOPBACK).
+        """
+        if info.get("isLoopbackDevice", False):
             return DeviceType.LOOPBACK
-        elif info['maxInputChannels'] > 0:
+        elif info.get("maxInputChannels", 0) > 0:
             return DeviceType.INPUT
         else:
             return DeviceType.OUTPUT
-
-    def _is_default_device(self, info: Dict) -> bool:
-        """Check if device is a default device.
-
-        Args:
-            info: Device information
-
-        Returns:
-            Whether device is default
-        """
-        try:
-            default_input = self._audio.get_default_input_device_info()
-            default_output = self._audio.get_default_output_device_info()
-            return (
-                info['index'] == default_input['index'] or
-                info['index'] == default_output['index']
-            )
-        except Exception:
-            return False
-
-    async def _get_default_input(self) -> Optional[DeviceInfo]:
-        """Get default input device.
-
-        Returns:
-            Default input device if found
-        """
-        try:
-            info = self._audio.get_default_wasapi_device(d_in=True)
-            if info and info['maxInputChannels'] > 0:
-                return DeviceInfo(
-                    id=info['index'],
-                    name=info['name'],
-                    type=DeviceType.INPUT,
-                    channels=info['maxInputChannels'],
-                    sample_rate=int(info['defaultSampleRate']),
-                    is_default=True
-                )
-            return None
-        except Exception:
-            return None
-
-    async def _get_default_output(self) -> Optional[DeviceInfo]:
-        """Get default output device.
-
-        Returns:
-            Default output device if found
-        """
-        try:
-            info = self._audio.get_default_wasapi_device(d_out=True)
-            if info:
-                return DeviceInfo(
-                    id=info['index'],
-                    name=info['name'],
-                    type=DeviceType.OUTPUT,
-                    channels=info['maxOutputChannels'],
-                    sample_rate=int(info['defaultSampleRate']),
-                    is_default=True
-                )
-            return None
-        except Exception:
-            return None
-
-    async def _get_default_loopback(self) -> Optional[DeviceInfo]:
-        """Get default loopback device.
-
-        Returns:
-            Default loopback device if found
-        """
-        try:
-            for info in self._audio.get_loopback_device_info_generator():
-                return DeviceInfo(
-                    id=info['index'],
-                    name=info['name'],
-                    type=DeviceType.LOOPBACK,
-                    channels=info['maxInputChannels'],
-                    sample_rate=int(info['defaultSampleRate']),
-                    is_default=True,
-                    is_loopback=True
-                )
-            return None
-        except Exception:
-            return None
-
-    async def _read_stream(
-        self,
-        stream: pyaudio.Stream,
-        chunk_size: int
-    ) -> Optional[bytes]:
-        """Read from audio stream.
-
-        Args:
-            stream: Audio stream
-            chunk_size: Size of chunks to read
-
-        Returns:
-            Audio data if available
-        """
-        try:
-            return bytes(stream.read(chunk_size))
-        except Exception:
-            return None
-
-    def _supports_sample_rate(
-        self,
-        device_info: Dict,
-        sample_rate: int
-    ) -> bool:
-        """Check if device supports sample rate.
-
-        Args:
-            device_info: Device information
-            sample_rate: Sample rate to check
-
-        Returns:
-            Whether rate is supported
-        """
-        try:
-            return abs(
-                device_info['defaultSampleRate'] - sample_rate
-            ) < 100
-        except Exception:
-            return False
-
-    async def __aenter__(self) -> 'DeviceManager':
-        """Enter async context."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Exit async context."""
-        self._audio.terminate()

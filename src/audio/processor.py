@@ -1,14 +1,16 @@
-"""Audio signal processing and enhancement."""
-from typing import Dict, Optional, Tuple
-import time
+"""Audio signal processing and enhancement with librosa Resampling."""
 
+import time
+from typing import Dict, Optional
+
+import librosa
 import numpy as np
-from scipy import signal
 
 from src.events.bus import EventBus
 from src.events.types import Event, EventType
+
 from .exceptions import ProcessingError
-from .types import AudioConfig, ProcessingResult, AudioMetrics
+from .types import AudioConfig, AudioMetrics, ProcessingResult
 
 
 class AudioProcessor:
@@ -64,6 +66,15 @@ class AudioProcessor:
             # Convert to float array
             float_data = self._to_float_array(audio_data)
 
+            # Resample if needed
+            if self.config.sample_rate != 16000:
+                float_data = await self._resample(float_data)
+
+            # Convert to mono if there are multiple channels
+            if self.config.channels > 1:
+                float_data = float_data.mean(axis=0).astype(float_data.dtype)
+                self.config.channels = 1
+
             # Apply processing steps
             processed = float_data
             if apply_noise_reduction and self._calibrated:
@@ -72,10 +83,7 @@ class AudioProcessor:
                 processed = await self._apply_gain(processed)
 
             # Calculate metrics
-            metrics = self._calculate_metrics(
-                processed,
-                time.time() - start_time
-            )
+            metrics = self._calculate_metrics(processed, time.time() - start_time)
 
             # Convert back to bytes
             processed_bytes = (processed * 32767).astype(np.int16).tobytes()
@@ -84,12 +92,14 @@ class AudioProcessor:
                 processed_data=processed_bytes,
                 metrics=metrics,
                 format=self.config.format,
-                sample_rate=self.config.sample_rate,
+                sample_rate=16000,
                 channels=self.config.channels,
-                duration=len(processed) / self.config.sample_rate
+                duration=len(processed_bytes) / (16000 * 2),
             )
 
-            await self._publish_processor_event("processing_complete", result)
+            await self._publish_processor_event(
+                "processing_complete", result.model_dump()
+            )
             return result
 
         except Exception as e:
@@ -116,17 +126,28 @@ class AudioProcessor:
                 "calibration_complete",
                 {
                     "noise_profile": float(self.noise_profile),
-                    "threshold": self.noise_threshold
-                }
+                    "threshold": self.noise_threshold,
+                },
             )
 
         except Exception as e:
             raise ProcessingError(f"Calibration failed: {e}")
 
-    async def _reduce_noise(
-        self,
-        audio_data: np.ndarray
-    ) -> np.ndarray:
+    async def _resample(self, audio_data: np.ndarray) -> np.ndarray:
+        """Resample audio data to 16,000 Hz using librosa.
+
+        Args:
+            audio_data: Audio data array
+
+        Returns:
+            Resampled audio data
+        """
+        resampled_audio = librosa.resample(
+            audio_data, orig_sr=self.config.sample_rate, target_sr=16000
+        )
+        return resampled_audio
+
+    async def _reduce_noise(self, audio_data: np.ndarray) -> np.ndarray:
         """Apply noise reduction.
 
         Args:
@@ -155,14 +176,15 @@ class AudioProcessor:
         current_max = np.max(np.abs(audio_data))
         self._running_max = max(current_max, self._running_max * 0.95)
 
-        if self._running_max > 0:
+        if self._running_max > 0.01:
             # Calculate gain adjustment
             gain = self.gain_target / self._running_max
             audio_data *= gain
 
         return np.clip(audio_data, -1.0, 1.0)
 
-    def _to_float_array(self, audio_bytes: bytes) -> np.ndarray:
+    @staticmethod
+    def _to_float_array(audio_bytes: bytes) -> np.ndarray:
         """Convert audio bytes to float array.
 
         Args:
@@ -171,14 +193,10 @@ class AudioProcessor:
         Returns:
             Normalized float array
         """
-        return np.frombuffer(
-            audio_bytes, dtype=np.int16
-        ).astype(np.float32) / 32768.0
+        return np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
     def _calculate_metrics(
-        self,
-        audio_data: np.ndarray,
-        processing_time: float
+        self, audio_data: np.ndarray, processing_time: float
     ) -> AudioMetrics:
         """Calculate audio metrics.
 
@@ -192,22 +210,14 @@ class AudioProcessor:
         return AudioMetrics(
             peak_level=float(np.max(np.abs(audio_data))),
             rms_level=float(np.sqrt(np.mean(audio_data**2))),
-            noise_level=float(
-                self.noise_profile if self._calibrated else 0.0
-            ),
+            noise_level=float(self.noise_profile if self._calibrated else 0.0),
             clipping_count=int(np.sum(np.abs(audio_data) > 0.99)),
             dropout_count=int(np.sum(np.abs(audio_data) < 0.01)),
             processing_time=processing_time,
-            buffer_stats={
-                "running_max": float(self._running_max)
-            }
+            buffer_stats={"running_max": float(self._running_max)},
         )
 
-    async def _publish_processor_event(
-        self,
-        status: str,
-        data: Dict
-    ) -> None:
+    async def _publish_processor_event(self, status: str, data: Dict) -> None:
         """Publish processor event.
 
         Args:
@@ -217,9 +227,6 @@ class AudioProcessor:
         await self.event_bus.publish(
             Event(
                 type=EventType.AUDIO_CHUNK,
-                data={
-                    "status": status,
-                    "processor_data": data
-                }
+                data={"status": status, "processor_data": data},
             )
         )
