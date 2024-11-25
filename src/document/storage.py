@@ -1,4 +1,5 @@
 """Document storage management."""
+
 from typing import Dict, Any, List, Optional, Protocol
 import json
 import aiofiles
@@ -6,42 +7,25 @@ from pathlib import Path
 from datetime import datetime
 
 from .types import ProcessedDocument, DocumentType
-from .exceptions import (
-    StorageError,
-    DocumentNotFoundError,
-    DocumentValidationError
-)
+from .exceptions import StorageError, DocumentNotFoundError, DocumentValidationError
 
 
 class StorageBackend(Protocol):
     """Protocol for storage backend implementations."""
 
-    async def store(
-            self,
-            key: str,
-            data: Dict[str, Any]
-    ) -> None:
+    async def store(self, key: str, data: Dict[str, Any]) -> None:
         """Store data with key."""
         ...
 
-    async def retrieve(
-            self,
-            key: str
-    ) -> Optional[Dict[str, Any]]:
+    async def retrieve(self, key: str) -> Optional[Dict[str, Any]]:
         """Retrieve data by key."""
         ...
 
-    async def delete(
-            self,
-            key: str
-    ) -> None:
+    async def delete(self, key: str) -> None:
         """Delete data by key."""
         ...
 
-    async def list_keys(
-            self,
-            prefix: Optional[str] = None
-    ) -> List[str]:
+    async def list_keys(self, prefix: Optional[str] = None) -> List[str]:
         """List stored keys."""
         ...
 
@@ -58,39 +42,29 @@ class FileSystemBackend:
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
 
-    async def store(
-            self,
-            key: str,
-            data: Dict[str, Any]
-    ) -> None:
+    async def store(self, key: str, data: Dict[str, Any]) -> None:
         """Store data in file."""
         file_path = self.base_path / f"{key}.json"
         try:
-            async with aiofiles.open(file_path, 'w') as f:
+            async with aiofiles.open(file_path, "w") as f:
                 await f.write(json.dumps(data, indent=2))
         except Exception as e:
             raise StorageError(f"Failed to store document: {e}")
 
-    async def retrieve(
-            self,
-            key: str
-    ) -> Optional[Dict[str, Any]]:
+    async def retrieve(self, key: str) -> Optional[Dict[str, Any]]:
         """Retrieve data from file."""
         file_path = self.base_path / f"{key}.json"
         if not file_path.exists():
             return None
 
         try:
-            async with aiofiles.open(file_path, 'r') as f:
+            async with aiofiles.open(file_path, "r") as f:
                 content = await f.read()
                 return json.loads(content)
         except Exception as e:
             raise StorageError(f"Failed to retrieve document: {e}")
 
-    async def delete(
-            self,
-            key: str
-    ) -> None:
+    async def delete(self, key: str) -> None:
         """Delete file."""
         file_path = self.base_path / f"{key}.json"
         try:
@@ -99,10 +73,7 @@ class FileSystemBackend:
         except Exception as e:
             raise StorageError(f"Failed to delete document: {e}")
 
-    async def list_keys(
-            self,
-            prefix: Optional[str] = None
-    ) -> List[str]:
+    async def list_keys(self, prefix: Optional[str] = None) -> List[str]:
         """List stored document keys."""
         try:
             files = list(self.base_path.glob("*.json"))
@@ -117,11 +88,7 @@ class FileSystemBackend:
 class DocumentStore:
     """Manages document storage and retrieval."""
 
-    def __init__(
-            self,
-            backend: StorageBackend,
-            cache_size: int = 100
-    ):
+    def __init__(self, backend: StorageBackend, cache_size: int = 100):
         """Initialize document store.
 
         Args:
@@ -133,10 +100,7 @@ class DocumentStore:
         self.cache: Dict[str, ProcessedDocument] = {}
         self.access_times: Dict[str, datetime] = {}
 
-    async def store_document(
-            self,
-            document: ProcessedDocument
-    ) -> None:
+    async def store_document(self, document: ProcessedDocument) -> None:
         """Store processed document.
 
         Args:
@@ -152,10 +116,7 @@ class DocumentStore:
                 raise DocumentValidationError("Missing required fields")
 
             # Store in backend
-            await self.backend.store(
-                document.id,
-                document.model_dump()
-            )
+            await self.backend.store(document.id, document.model_dump())
 
             # Update cache
             self._update_cache(document.id, document)
@@ -165,10 +126,7 @@ class DocumentStore:
         except Exception as e:
             raise StorageError(f"Failed to store document: {e}")
 
-    async def get_document(
-            self,
-            document_id: str
-    ) -> ProcessedDocument:
+    async def get_document(self, document_id: str) -> ProcessedDocument:
         """Retrieve document by ID.
 
         Args:
@@ -202,10 +160,7 @@ class DocumentStore:
         except Exception as e:
             raise StorageError(f"Failed to retrieve document: {e}")
 
-    async def delete_document(
-            self,
-            document_id: str
-    ) -> None:
+    async def delete_document(self, document_id: str) -> None:
         """Delete document.
 
         Args:
@@ -227,8 +182,7 @@ class DocumentStore:
             raise StorageError(f"Failed to delete document: {e}")
 
     async def list_documents(
-            self,
-            doc_type: Optional[DocumentType] = None
+        self, doc_type: Optional[DocumentType] = None
     ) -> List[str]:
         """List stored document IDs.
 
@@ -247,11 +201,7 @@ class DocumentStore:
         except Exception as e:
             raise StorageError(f"Failed to list documents: {e}")
 
-    def _update_cache(
-            self,
-            doc_id: str,
-            document: ProcessedDocument
-    ) -> None:
+    def _update_cache(self, doc_id: str, document: ProcessedDocument) -> None:
         """Update cache with document.
 
         Args:
@@ -260,10 +210,7 @@ class DocumentStore:
         """
         # Remove the oldest if cache full
         if len(self.cache) >= self.cache_size:
-            oldest = min(
-                self.access_times.items(),
-                key=lambda x: x[1]
-            )[0]
+            oldest = min(self.access_times.items(), key=lambda x: x[1])[0]
             self.cache.pop(oldest)
             self.access_times.pop(oldest)
 
