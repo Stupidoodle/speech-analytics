@@ -1,0 +1,22 @@
+# Linting and Formatting
+ruff==0.7.4
+black==24.10.0
+mypy==1.13.0
+pylint==3.3.1
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+
+# Type Checking
+# Removed types-all; add specific type stubs as needed
+# Example:
+# types-requests==2.31.0.4
+# types-setuptools==68.0.0.3
+
+# Documentation
+pdoc  # Install the latest version of pdoc
+
+# Pre-commit
+pre-commit==4.0.1
